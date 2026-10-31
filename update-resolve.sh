@@ -1,10 +1,16 @@
 #!/bin/bash
-# update-resolve.sh — Automated DaVinci Resolve updater for Arch Linux
-# Checks for updates, downloads via Blackmagic API, builds via makepkg
+# update-resolve.sh — Automated DaVinci Resolve updater for Arch Linux and macOS
+# Checks for updates, downloads via Blackmagic API, then builds via makepkg
+# (Arch Linux) or installs the bundled .pkg (macOS). The OS is detected automatically.
 #
 # Usage: ./update-resolve.sh [--force] [--check-only] [--skip-install] [--reconfigure]
 #
-# Dependencies: curl, jq, makepkg, pacman, git, updpkgsums (pacman-contrib)
+# Dependencies (Arch Linux): curl, jq, makepkg, pacman, git, updpkgsums (pacman-contrib)
+# Dependencies (macOS): curl, jq (built into macOS 15+, else `brew install jq`),
+#                       unzip, hdiutil/diskutil, installer (built in)
+#
+# macOS ships bash 3.2: everything that runs there must avoid mapfile and
+# associative arrays. Those are fine inside the Linux-only functions.
 #
 # On first run, you'll be prompted for registration info (required by
 # Blackmagic's download API). Your info is saved locally in a config
@@ -21,6 +27,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build"
 CONFIG_FILE="${SCRIPT_DIR}/.config"
 PRODUCT="davinci-resolve"  # Change to "davinci-resolve-studio" for Studio edition
+APP_PATH="/Applications/DaVinci Resolve/DaVinci Resolve.app"  # macOS only
+
+# Platform: Blackmagic's API serves both from the same endpoints, keyed by these names
+case "$(uname -s)" in
+    Darwin) PLATFORM="mac";   ZIP_SUFFIX="Mac";   REFER_PLATFORM="Mac%20OS%20X" ;;
+    *)      PLATFORM="linux"; ZIP_SUFFIX="Linux"; REFER_PLATFORM="Linux" ;;
+esac
 
 # Blackmagic API endpoints
 API_BASE="https://www.blackmagicdesign.com/api"
@@ -31,7 +44,11 @@ API_BASE="https://www.blackmagicdesign.com/api"
 REFER_ID="77ef91f67a9e411bbbe299e595b4cfcc"
 
 # Shared curl options
-UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+if [[ "$PLATFORM" == "mac" ]]; then
+    UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+else
+    UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+fi
 
 # Static Google Analytics cookies to make requests look like normal browser traffic.
 # These are NOT tied to any real user session — they're generic values used to avoid
@@ -102,6 +119,9 @@ prompt_config() {
         exit 1
     fi
 
+    echo ""
+    ask_cleanup_zip
+
     # Save config (values are stored verbatim, not as shell code)
     {
         echo "# update-resolve configuration (auto-generated)"
@@ -114,19 +134,51 @@ prompt_config() {
         printf 'state=%s\n' "$REG_STATE"
         printf 'city=%s\n' "$REG_CITY"
         printf 'street=%s\n' "$REG_STREET"
+        printf 'cleanup_zip=%s\n' "$CLEANUP_ZIP"
     } > "$CONFIG_FILE"
     chmod 600 "$CONFIG_FILE"
     ok "Configuration saved to ${CONFIG_FILE}"
     echo ""
 }
 
+ask_cleanup_zip() {
+    local answer
+    # `|| true`: with no terminal (cron), read hits EOF and the default applies instead of set -e exiting
+    read -rp "Delete the downloaded installer zip from build/ after a successful update? [Y/n]: " answer || true
+    case "$answer" in
+        [nN]*) CLEANUP_ZIP="no" ;;
+        *)     CLEANUP_ZIP="yes" ;;
+    esac
+}
+
+# Remove the installer zip once the update succeeded, if the user opted in
+cleanup_zip() {
+    local zip_path="${BUILD_DIR}/DaVinci_Resolve_${1}_${ZIP_SUFFIX}.zip"
+    if [[ "$CLEANUP_ZIP" == "yes" && -f "$zip_path" ]]; then
+        rm -f "$zip_path"
+        ok "Removed $(basename "$zip_path") (cleanup_zip=yes in ${CONFIG_FILE})"
+    fi
+}
+
 load_config() {
     if [[ "$RECONFIGURE" == "true" || ! -f "$CONFIG_FILE" ]]; then
+        if [[ ! -t 0 ]]; then
+            err "Registration setup needs a terminal. Run ./update-resolve.sh once interactively first."
+            exit 1
+        fi
         prompt_config
     fi
 
     # Read config safely — no shell evaluation, just plain key=value parsing
-    _cfg() { grep "^$1=" "$CONFIG_FILE" | cut -d= -f2-; }
+    _cfg() { grep "^$1=" "$CONFIG_FILE" | cut -d= -f2- || true; }
+
+    # Configs written before cleanup_zip existed: ask once and append, no full re-setup
+    CLEANUP_ZIP=$(_cfg cleanup_zip)
+    if [[ -z "$CLEANUP_ZIP" ]]; then
+        ask_cleanup_zip
+        printf 'cleanup_zip=%s\n' "$CLEANUP_ZIP" >> "$CONFIG_FILE"
+        ok "Saved cleanup preference to ${CONFIG_FILE}"
+    fi
     local cfg_firstname cfg_lastname cfg_email cfg_phone cfg_country cfg_state cfg_city cfg_street
     cfg_firstname=$(_cfg firstname)
     cfg_lastname=$(_cfg lastname)
@@ -228,13 +280,17 @@ install_dependencies() {
 
 # Step 1: Get installed version
 get_installed_version() {
-    pacman -Q "${PRODUCT}" 2>/dev/null | awk '{print $2}' | cut -d- -f1 || echo "none"
+    if [[ "$PLATFORM" == "mac" ]]; then
+        defaults read "${APP_PATH}/Contents/Info" CFBundleShortVersionString 2>/dev/null || echo "none"
+    else
+        pacman -Q "${PRODUCT}" 2>/dev/null | awk '{print $2}' | cut -d- -f1 || echo "none"
+    fi
 }
 
 # Step 2: Get latest version from Blackmagic API
 get_latest_version() {
     local response
-    response=$(curl -s "${API_BASE}/support/latest-stable-version/${PRODUCT}/linux")
+    response=$(curl -s "${API_BASE}/support/latest-stable-version/${PRODUCT}/${PLATFORM}")
 
     if [[ -z "$response" || "$response" == *"error"* ]]; then
         err "Failed to query Blackmagic API for latest version"
@@ -242,12 +298,13 @@ get_latest_version() {
     fi
 
     local major minor release download_id
-    major=$(echo "$response" | jq -r '.linux.major')
-    minor=$(echo "$response" | jq -r '.linux.minor')
-    release=$(echo "$response" | jq -r '.linux.releaseNum')
-    download_id=$(echo "$response" | jq -r '.linux.downloadId')
+    major=$(echo "$response" | jq -r ".${PLATFORM}.major")
+    minor=$(echo "$response" | jq -r ".${PLATFORM}.minor")
+    release=$(echo "$response" | jq -r ".${PLATFORM}.releaseNum")
+    download_id=$(echo "$response" | jq -r ".${PLATFORM}.downloadId")
 
-    if [[ "$release" == "0" ]]; then
+    # pacman/AUR versions drop a trailing .0; the macOS app bundle keeps it (21.0.0)
+    if [[ "$release" == "0" && "$PLATFORM" == "linux" ]]; then
         echo "${major}.${minor}|${download_id}"
     else
         echo "${major}.${minor}.${release}|${download_id}"
@@ -258,7 +315,7 @@ get_latest_version() {
 download_resolve() {
     local download_id="$1"
     local version="$2"
-    local zip_name="DaVinci_Resolve_${version}_Linux.zip"
+    local zip_name="DaVinci_Resolve_${version}_${ZIP_SUFFIX}.zip"
     local zip_path="${BUILD_DIR}/${zip_name}"
 
     if [[ -f "$zip_path" && "$FORCE" != "true" ]]; then
@@ -274,7 +331,7 @@ download_resolve() {
         -H "Origin: https://www.blackmagicdesign.com" \
         -H "User-Agent: ${UA}" \
         -H "Content-Type: application/json;charset=UTF-8" \
-        -H "Referer: https://www.blackmagicdesign.com/support/download/${REFER_ID}/Linux" \
+        -H "Referer: https://www.blackmagicdesign.com/support/download/${REFER_ID}/${REFER_PLATFORM}" \
         -b "${COOKIES}" \
         -d "${REG_DATA}")
 
@@ -285,19 +342,80 @@ download_resolve() {
 
     log "Downloading ${zip_name} (~3GB)..."
 
-    curl -L --progress-bar \
+    # Download to .part so an interrupted run isn't mistaken for a finished zip next time
+    if ! curl -fL --progress-bar \
         -H "User-Agent: ${UA}" \
-        -o "$zip_path" \
-        "$download_url"
-
-    if [[ -f "$zip_path" ]]; then
-        local size
-        size=$(du -h "$zip_path" | cut -f1)
-        ok "Downloaded: ${zip_name} (${size})"
-    else
+        -o "${zip_path}.part" \
+        "$download_url"; then
         err "Download failed"
         return 1
     fi
+    mv "${zip_path}.part" "$zip_path"
+
+    local size
+    size=$(du -h "$zip_path" | cut -f1)
+    ok "Downloaded: ${zip_name} (${size})"
+}
+
+# macOS: zip -> .dmg -> .pkg -> installer
+install_mac_pkg() {
+    local version="$1"
+    local zip_path="${BUILD_DIR}/DaVinci_Resolve_${version}_Mac.zip"
+    local extract_dir="${BUILD_DIR}/extract"
+    local mount_dir="${BUILD_DIR}/mnt"
+
+    log "Extracting $(basename "$zip_path")..."
+    rm -rf "$extract_dir"
+    mkdir -p "$extract_dir"
+    unzip -q "$zip_path" -d "$extract_dir"
+
+    local dmg
+    dmg=$(find "$extract_dir" -name '*.dmg' -not -path '*/__MACOSX/*' | head -1)
+    if [[ -z "$dmg" ]]; then
+        err "No .dmg found in $(basename "$zip_path")"
+        return 1
+    fi
+
+    log "Mounting $(basename "$dmg")..."
+    mkdir -p "$mount_dir"
+    # `diskutil image` replaces `hdiutil attach` (deprecated on newer macOS); older macOS lacks it
+    if diskutil image &>/dev/null; then
+        diskutil image attach --readOnly --nobrowse --mountPoint "$mount_dir" "$dmg" > /dev/null
+    else
+        hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mount_dir" > /dev/null
+    fi
+    trap 'hdiutil detach "'"$mount_dir"'" -quiet 2>/dev/null || true' EXIT
+
+    local pkg
+    pkg=$(find "$mount_dir" -maxdepth 2 -name '*.pkg' | head -1)
+    if [[ -z "$pkg" ]]; then
+        err "No .pkg installer found in $(basename "$dmg")"
+        return 1
+    fi
+
+    if pgrep -xq "Resolve"; then
+        warn "DaVinci Resolve is running — quit it before the installer continues"
+        read -rp "Press Enter once Resolve is closed..."
+    fi
+
+    log "Installing $(basename "$pkg") (needs your password)..."
+    # -verboseR emits machine-readable "installer:%NN.N" / "installer:PHASE:..." lines;
+    # turn them into one live status line instead of minutes of silence
+    local pct=0 phase="Starting"
+    sudo installer -pkg "$pkg" -target / -verboseR | while IFS= read -r line; do
+        case $line in
+            installer:%*) pct=${line#installer:%}; pct=${pct%%.*} ;;
+            installer:PHASE:*) phase=${line#installer:PHASE:} ;;
+            *) continue ;;
+        esac
+        printf '\r\033[K    %3d%%  %s' "$pct" "$phase"
+    done
+    echo ""
+
+    hdiutil detach "$mount_dir" -quiet
+    trap - EXIT
+    rm -rf "$extract_dir"
+    ok "Installed $(basename "$pkg")"
 }
 
 # Step 4: Fetch and update PKGBUILD
@@ -470,13 +588,18 @@ check_runtime_dirs() {
 }
 
 # --- Main ---
-main() {
-    echo ""
-    echo -e "${BLUE}╔══════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║  DaVinci Resolve Updater for Arch Linux  ║${NC}"
-    echo -e "${BLUE}╚══════════════════════════════════════════╝${NC}"
-    echo ""
 
+check_tools_mac() {
+    for cmd in curl jq unzip hdiutil installer; do
+        if ! command -v "$cmd" &>/dev/null; then
+            err "Missing dependency: $cmd"
+            [[ "$cmd" != "jq" ]] || err "Install it with: brew install jq"
+            exit 1
+        fi
+    done
+}
+
+check_tools_linux() {
     # Install script dependencies if missing (command -> package that provides it)
     local -A tool_pkgs=([curl]=curl [jq]=jq [git]=git [updpkgsums]=pacman-contrib)
     local missing_tools=()
@@ -497,9 +620,28 @@ main() {
             exit 1
         fi
     done
+}
 
-    # Load or create configuration
-    load_config
+main() {
+    echo ""
+    echo -e "${BLUE}╔══════════════════════════════════════════╗${NC}"
+    if [[ "$PLATFORM" == "mac" ]]; then
+        echo -e "${BLUE}║    DaVinci Resolve Updater for macOS     ║${NC}"
+    else
+        echo -e "${BLUE}║  DaVinci Resolve Updater for Arch Linux  ║${NC}"
+    fi
+    echo -e "${BLUE}╚══════════════════════════════════════════╝${NC}"
+    echo ""
+
+    if [[ "$PLATFORM" == "mac" ]]; then
+        check_tools_mac
+    else
+        check_tools_linux
+    fi
+
+    # Registration is only needed to download, so --check-only and up-to-date runs
+    # skip it (below); --reconfigure still runs up front so it works when current
+    [[ "$RECONFIGURE" != "true" ]] || load_config
 
     # Get versions
     local installed_version
@@ -534,6 +676,26 @@ main() {
         exit 0
     fi
 
+    [[ -n "${REG_DATA:-}" ]] || load_config
+
+    if [[ "$PLATFORM" == "mac" ]]; then
+        mkdir -p "$BUILD_DIR"
+        download_resolve "$download_id" "$latest_version"
+
+        if [[ "$SKIP_INSTALL" == "true" ]]; then
+            ok "Downloaded to ${BUILD_DIR} (not installed due to --skip-install)"
+            exit 0
+        fi
+
+        install_mac_pkg "$latest_version"
+        cleanup_zip "$latest_version"
+
+        echo ""
+        ok "DaVinci Resolve ${latest_version} installed successfully!"
+        log "Launch it from /Applications/DaVinci Resolve."
+        exit 0
+    fi
+
     # Install dependencies (repo + AUR)
     install_dependencies
 
@@ -551,6 +713,7 @@ main() {
 
     if [[ "$SKIP_INSTALL" != "true" ]]; then
         check_runtime_dirs
+        cleanup_zip "$latest_version"
     fi
 
     echo ""

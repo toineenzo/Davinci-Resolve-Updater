@@ -2,18 +2,20 @@
 
 Automated DaVinci Resolve updater for Arch Linux and macOS.
 
+One script for both: `update-resolve.sh` detects the OS and takes the right install path. Flags and the registration prompt are the same on both.
+
 ## macOS
 
 ```bash
 git clone https://github.com/toineenzo/Davinci-Resolve-Updater.git
 cd Davinci-Resolve-Updater
-./update-resolve-mac.sh               # check, download, install
-./update-resolve-mac.sh --check-only  # just compare installed vs latest
+./update-resolve.sh               # check, download, install
+./update-resolve.sh --check-only  # just compare installed vs latest
 ```
 
-`update-resolve-mac.sh` reads the installed version from `/Applications/DaVinci Resolve/DaVinci Resolve.app`, asks Blackmagic's API for the latest Mac build, downloads the zip (same registration prompt as Linux), mounts the `.dmg` inside it and runs the bundled `.pkg` with `sudo installer`. Flags are the same as the Linux script (`--force`, `--check-only`, `--skip-install`, `--reconfigure`). Needs only built-in tools plus `jq` (built in on macOS 15+, otherwise `brew install jq`). Set `PRODUCT="davinci-resolve-studio"` at the top for Studio. Test: `./tests/test-mac-install.sh`.
+On macOS the script reads the installed version from `/Applications/DaVinci Resolve/DaVinci Resolve.app`, asks Blackmagic's API for the latest Mac build, downloads the zip, mounts the `.dmg` inside it and runs the bundled `.pkg` with `sudo installer` (with a live progress line). Needs only built-in tools plus `jq` (built in on macOS 15+, otherwise `brew install jq`). Set `PRODUCT="davinci-resolve-studio"` at the top for Studio. Test: `./tests/test-mac-install.sh`.
 
-The rest of this README covers the Arch Linux script.
+The rest of this README covers Arch Linux.
 
 **Script version:** 2026.10.1 | **Tested with DaVinci Resolve:** 21.1.2-1
 
@@ -80,7 +82,7 @@ As of Resolve 21.1.2-1, every dependency is in the official repos:
 
 ```bash
 # Clone the repo
-git clone https://github.com/drake495/Davinci-Resolve-Updater.git
+git clone https://github.com/toineenzo/Davinci-Resolve-Updater.git
 cd Davinci-Resolve-Updater
 
 # Make executable
@@ -110,6 +112,8 @@ ln -s "$(pwd)/update-resolve.sh" ~/.local/bin/update-resolve
 ```
 
 On first run, you'll be prompted for registration info (name, email, etc.). This is the same info Blackmagic requires on their download page. It's saved locally in a `.config` file next to the script and reused on subsequent runs.
+
+The first-time setup also asks whether to delete the downloaded installer zip from `build/` after a successful update (default: yes). It's stored as `cleanup_zip=yes` or `cleanup_zip=no` in `.config`; edit it there or re-run with `--reconfigure`. Configs from before this setting existed get the question once on the next run. With `--skip-install` the zip is always kept.
 
 ## DaVinci Resolve Studio
 
