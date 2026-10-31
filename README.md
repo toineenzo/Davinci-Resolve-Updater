@@ -4,7 +4,7 @@
 
 This is a fork of [drake495/Davinci-Resolve-Updater](https://github.com/drake495/Davinci-Resolve-Updater), which supports Arch Linux only. The Arch route works the same way as upstream. This fork adds macOS, other Linux distros, a Homebrew tap and automatic update checks.
 
-**Script version:** 2026.10.1 | **Tested with DaVinci Resolve:** 21.1.2-1
+**Script version:** 2026.10.2 | **Tested with DaVinci Resolve:** 21.1.2-1
 
 ## Contents
 

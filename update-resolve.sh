@@ -19,7 +19,7 @@
 set -euo pipefail
 
 # Version info
-SCRIPT_VERSION="2026.10.1"
+SCRIPT_VERSION="2026.10.2"
 RESOLVE_TESTED="21.1.2-1"
 
 # Configuration
