@@ -36,6 +36,6 @@ cask "davinci-resolve" do
       "$(brew --repo toineenzo/resolve)/update-resolve.sh" --reconfigure --check-only
 
     `brew uninstall` only forgets the cask. To remove Resolve itself, run
-      /Applications/DaVinci Resolve/Uninstall Resolve.app
+      open "/Applications/DaVinci Resolve/Uninstall Resolve.app"
   EOS
 end

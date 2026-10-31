@@ -35,6 +35,31 @@ case "$(uname -s)" in
     *)      PLATFORM="linux"; ZIP_SUFFIX="Linux"; REFER_PLATFORM="Linux" ;;
 esac
 
+# Linux install route: Arch builds the AUR package; every other distro runs Blackmagic's
+# own installer, after installing the dependency list that installer itself checks for
+# (apt: Debian/Ubuntu/Mint, dnf/yum: RHEL/CentOS/Rocky/Fedora, zypper: openSUSE).
+# /etc/os-release decides first: a second package manager (Debian ships `pacman`,
+# openSUSE ships `dnf`) must not pull a distro onto the wrong route.
+LINUX_FAMILY=""
+if [[ "$PLATFORM" == "linux" ]]; then
+    os_ids=$( (. /etc/os-release 2>/dev/null && echo " ${ID:-} ${ID_LIKE:-} ") || true)
+    case "$os_ids" in
+        *" arch "*)                                    LINUX_FAMILY="arch" ;;
+        *" debian "*|*" ubuntu "*)                     LINUX_FAMILY="deb" ;;
+        *" suse "*|*" opensuse "*|*opensuse-*)         LINUX_FAMILY="suse" ;;
+        *" fedora "*|*" rhel "*|*" centos "*)          LINUX_FAMILY="rpm" ;;
+    esac
+    unset os_ids
+fi
+if [[ "$PLATFORM" == "linux" && -z "$LINUX_FAMILY" ]]; then
+    if command -v pacman &>/dev/null; then LINUX_FAMILY="arch"
+    elif command -v apt-get &>/dev/null; then LINUX_FAMILY="deb"
+    elif command -v dnf &>/dev/null || command -v yum &>/dev/null; then LINUX_FAMILY="rpm"
+    elif command -v zypper &>/dev/null; then LINUX_FAMILY="suse"
+    else LINUX_FAMILY="other"
+    fi
+fi
+
 # Blackmagic API endpoints
 API_BASE="https://www.blackmagicdesign.com/api"
 
@@ -72,18 +97,21 @@ FORCE=false
 CHECK_ONLY=false
 SKIP_INSTALL=false
 RECONFIGURE=false
+TIMER=false
 for arg in "$@"; do
     case $arg in
         --force) FORCE=true ;;
         --check-only) CHECK_ONLY=true ;;
         --skip-install) SKIP_INSTALL=true ;;
         --reconfigure) RECONFIGURE=true ;;
+        --timer) TIMER=true ;;
         -h|--help)
             echo "Usage: $0 [--force] [--check-only] [--skip-install] [--reconfigure]"
             echo "  --force        Update even if already on latest version"
             echo "  --check-only   Just check for updates, don't download or install"
             echo "  --skip-install Download and build but don't install"
             echo "  --reconfigure  Re-enter registration info"
+            echo "  --timer        Unattended check, run by the systemd timer (Linux; see README)"
             exit 0
             ;;
         *) err "Unknown argument: $arg"; exit 1 ;;
@@ -121,6 +149,8 @@ prompt_config() {
 
     echo ""
     ask_cleanup_zip
+    [[ "$PLATFORM" != "linux" ]] || ask_check_interval
+    [[ "$PLATFORM" != "mac" ]] || ask_homebrew
 
     # Save config (values are stored verbatim, not as shell code)
     {
@@ -135,10 +165,47 @@ prompt_config() {
         printf 'city=%s\n' "$REG_CITY"
         printf 'street=%s\n' "$REG_STREET"
         printf 'cleanup_zip=%s\n' "$CLEANUP_ZIP"
+        [[ "$PLATFORM" != "linux" ]] || printf 'check_interval=%s\n' "$CHECK_INTERVAL"
+        [[ "$PLATFORM" != "mac" ]] || printf 'homebrew=%s\n' "$USE_HOMEBREW"
     } > "$CONFIG_FILE"
     chmod 600 "$CONFIG_FILE"
     ok "Configuration saved to ${CONFIG_FILE}"
+    [[ "$PLATFORM" != "linux" ]] || setup_timer "$CHECK_INTERVAL"
     echo ""
+}
+
+ask_homebrew() {
+    local answer=""
+    if ! command -v brew &>/dev/null; then
+        USE_HOMEBREW="no"
+        return 0
+    fi
+    if [[ -t 0 ]]; then
+        echo "Homebrew can install DaVinci Resolve as a cask, so it updates with \`brew upgrade\` (and apps like Updatest)."
+        read -rp "Install and update DaVinci Resolve through Homebrew? [Y/n]: " answer || true
+    else
+        answer="n"
+    fi
+    case "$answer" in
+        [nN]*) USE_HOMEBREW="no" ;;
+        *)     USE_HOMEBREW="yes" ;;
+    esac
+}
+
+ask_check_interval() {
+    local answer=""
+    # No terminal (the timer itself, cron): never create timers unattended
+    if [[ -t 0 ]]; then
+        read -rp "Check for updates automatically with a systemd timer? [d]aily, [w]eekly, [m]onthly or [n]ever [w]: " answer || true
+    else
+        answer="n"
+    fi
+    case "$answer" in
+        [dD]*) CHECK_INTERVAL="daily" ;;
+        [mM]*) CHECK_INTERVAL="monthly" ;;
+        [nN]*) CHECK_INTERVAL="never" ;;
+        *)     CHECK_INTERVAL="weekly" ;;
+    esac
 }
 
 ask_cleanup_zip() {
@@ -178,6 +245,21 @@ load_config() {
         ask_cleanup_zip
         printf 'cleanup_zip=%s\n' "$CLEANUP_ZIP" >> "$CONFIG_FILE"
         ok "Saved cleanup preference to ${CONFIG_FILE}"
+    fi
+    USE_HOMEBREW=$(_cfg homebrew)
+    if [[ "$PLATFORM" == "mac" && -z "$USE_HOMEBREW" ]]; then
+        ask_homebrew
+        printf 'homebrew=%s\n' "$USE_HOMEBREW" >> "$CONFIG_FILE"
+        ok "Saved Homebrew preference to ${CONFIG_FILE}"
+    fi
+    CHECK_INTERVAL=$(_cfg check_interval)
+    if [[ "$PLATFORM" == "linux" && -z "$CHECK_INTERVAL" ]]; then
+        ask_check_interval
+        printf 'check_interval=%s\n' "$CHECK_INTERVAL" >> "$CONFIG_FILE"
+        ok "Saved update check preference to ${CONFIG_FILE}"
+        # "never" here (often the no-terminal default) must not remove a timer; only
+        # --reconfigure, which asks every question, may do that
+        [[ "$CHECK_INTERVAL" == "never" ]] || setup_timer "$CHECK_INTERVAL"
     fi
     local cfg_firstname cfg_lastname cfg_email cfg_phone cfg_country cfg_state cfg_city cfg_street
     cfg_firstname=$(_cfg firstname)
@@ -282,8 +364,17 @@ install_dependencies() {
 get_installed_version() {
     if [[ "$PLATFORM" == "mac" ]]; then
         defaults read "${APP_PATH}/Contents/Info" CFBundleShortVersionString 2>/dev/null || echo "none"
-    else
+    elif [[ "$LINUX_FAMILY" == "arch" ]]; then
         pacman -Q "${PRODUCT}" 2>/dev/null | awk '{print $2}' | cut -d- -f1 || echo "none"
+    else
+        # Blackmagic's installer registers no package; its Welcome.txt opens with
+        # "You are about to install DaVinci Resolve [Studio] 21.1.2."
+        local v
+        v=$(grep -o -m1 'DaVinci Resolve \(Studio \)\?[0-9][0-9.]*[0-9]' /opt/resolve/docs/Welcome.txt 2>/dev/null \
+            | awk '{print $NF}') || true
+        # Match get_latest_version's Linux format, which drops a trailing .0
+        [[ ! "$v" =~ ^[0-9]+\.[0-9]+\.0$ ]] || v=${v%.0}
+        echo "${v:-none}"
     fi
 }
 
@@ -357,6 +448,67 @@ download_resolve() {
     ok "Downloaded: ${zip_name} (${size})"
 }
 
+# --- macOS through Homebrew (homebrew=yes in .config) ---
+
+HOMEBREW_TAP="toineenzo/resolve"
+HOMEBREW_TAP_URL="https://github.com/toineenzo/Davinci-Resolve-Updater"
+HOMEBREW_CASK="${HOMEBREW_TAP}/davinci-resolve"
+
+# Tap this repo and give its download strategy the registration info (it reads the
+# .config at the tap's root). Safe to repeat: it also refreshes that copy after --reconfigure.
+setup_homebrew_tap() {
+    if ! brew tap | grep -qx "$HOMEBREW_TAP"; then
+        log "Adding Homebrew tap ${HOMEBREW_TAP}..."
+        brew tap "$HOMEBREW_TAP" "$HOMEBREW_TAP_URL"
+    fi
+    # Homebrew 7+ only loads casks from trusted taps; older versions have no `brew trust`
+    brew trust "$HOMEBREW_TAP" &>/dev/null || true
+
+    local tap_dir
+    tap_dir=$(brew --repo "$HOMEBREW_TAP")
+    if [[ "$(cd "$tap_dir" && pwd -P)" != "$(cd "$SCRIPT_DIR" && pwd -P)" ]]; then
+        install -m 600 "$CONFIG_FILE" "${tap_dir}/.config"
+    fi
+}
+
+# Install or upgrade the cask. Returns 0 when Resolve is now on the cask's version.
+update_via_homebrew() {
+    setup_homebrew_tap
+    if brew list --cask "$HOMEBREW_CASK" &>/dev/null; then
+        if [[ "$FORCE" == "true" ]]; then
+            log "Reinstalling the ${HOMEBREW_CASK} cask (needs your password)..."
+            brew reinstall --cask "$HOMEBREW_CASK"
+        else
+            log "Upgrading the ${HOMEBREW_CASK} cask (needs your password)..."
+            brew upgrade --cask "$HOMEBREW_CASK"
+        fi
+    else
+        # The cask is bumped up to 6 hours after a release; if Resolve is already newer
+        # (installed by the script route), installing the cask now would downgrade it
+        local cask_version installed
+        cask_version=$(brew info --cask --json=v2 "$HOMEBREW_CASK" | jq -r '.casks[0].version')
+        installed=$(get_installed_version)
+        if [[ "$installed" != "none" && "$(printf '%s\n%s\n' "$cask_version" "$installed" | sort -V | tail -1)" != "$cask_version" ]]; then
+            warn "The cask is on ${cask_version}, older than the installed ${installed}; not installing it now (it would downgrade). Run again once it has caught up."
+            return 0
+        fi
+        log "Installing the ${HOMEBREW_CASK} cask (downloads ~4GB, needs your password)..."
+        brew install --cask "$HOMEBREW_CASK"
+    fi
+
+    # Homebrew keeps the downloaded zip in its cache; honour cleanup_zip for it too
+    # (found by name: `brew --cache --cask` resolves the URL, i.e. POSTs the registration)
+    if [[ "$CLEANUP_ZIP" == "yes" ]]; then
+        local cached removed=false
+        for cached in "$(brew --cache)"/downloads/*--DaVinci_Resolve_*_Mac.zip; do
+            [[ -f "$cached" ]] || continue
+            rm -f "$cached"
+            removed=true
+        done
+        [[ "$removed" == "false" ]] || ok "Removed Homebrew's cached download (cleanup_zip=yes in ${CONFIG_FILE})"
+    fi
+}
+
 # macOS: zip -> .dmg -> .pkg -> installer
 install_mac_pkg() {
     local version="$1"
@@ -416,6 +568,122 @@ install_mac_pkg() {
     trap - EXIT
     rm -rf "$extract_dir"
     ok "Installed $(basename "$pkg")"
+}
+
+# --- Other Linux distros: Blackmagic's own installer ---
+
+# Blackmagic's AppRun checks a per-distro package list (name-minversion lines inside
+# check_ubuntu_package_deps / check_centos_package_deps / check_suse_package_deps).
+# Read that list from the installer being installed, so it can't drift.
+read_apprun_packages() {
+    sed -n "/^function $2()/,/^}/p" "$1" \
+        | grep -E '^[[:space:]]+[A-Za-z0-9._+-]+-[0-9.]+$' \
+        | sed -E 's/^[[:space:]]+//; s/-[0-9.]+$//'
+}
+
+install_run_dependencies() {
+    local apprun="$1" pkgs=() p
+    log "Installing DaVinci Resolve's dependencies..."
+    case "$LINUX_FAMILY" in
+        deb)
+            # One broken third-party repo shouldn't stop the update; the cached lists do
+            sudo apt-get update || warn "apt-get update failed; using the cached package lists"
+            # libgl1: the installer itself needs libGL.so.1, which Blackmagic's list leaves out
+            pkgs=(libgl1)
+            # A real package has an install candidate; a virtual name shows "(none)"
+            _apt_candidate() { apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/ {print $2}'; }
+            local cand
+            while read -r p; do
+                # Ubuntu 24.04+ / Debian 13 renamed some libraries with a t64 suffix, leaving
+                # the old name as a virtual package
+                cand=$(_apt_candidate "$p")
+                if [[ -n "$cand" && "$cand" != "(none)" ]]; then
+                    pkgs+=("$p")
+                elif cand=$(_apt_candidate "${p}t64") && [[ -n "$cand" && "$cand" != "(none)" ]]; then
+                    pkgs+=("${p}t64")
+                else
+                    warn "No package ${p} (or ${p}t64) on this release, skipping"
+                fi
+            done < <(read_apprun_packages "$apprun" check_ubuntu_package_deps)
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}"
+            ;;
+        rpm)
+            mapfile -t pkgs < <(read_apprun_packages "$apprun" check_centos_package_deps)
+            # Not in Blackmagic's CentOS 7 list, but Resolve links libcrypt.so.1 (moved out
+            # of glibc after CentOS 7) and libOpenCL.so.1 (the OpenCL loader)
+            pkgs+=(libxcrypt-compat ocl-icd)
+            # The list is written for CentOS 7; skip names a newer release doesn't ship
+            if command -v dnf &>/dev/null; then
+                if dnf --version 2>/dev/null | grep -q dnf5; then
+                    sudo dnf install -y --skip-unavailable "${pkgs[@]}"
+                else
+                    sudo dnf install -y --setopt=strict=0 "${pkgs[@]}"
+                fi
+            else
+                sudo yum install -y --skip-broken "${pkgs[@]}"
+            fi
+            ;;
+        suse)
+            mapfile -t pkgs < <(read_apprun_packages "$apprun" check_suse_package_deps)
+            # Not in Blackmagic's list, but Resolve links libOpenCL.so.1 (the OpenCL loader)
+            pkgs+=(libOpenCL1)
+            sudo zypper --non-interactive install --no-recommends "${pkgs[@]}"
+            ;;
+        *)
+            warn "Unknown package manager: install DaVinci Resolve's dependencies yourself if it won't start"
+            ;;
+    esac
+}
+
+# Zip -> .run (an AppImage) -> unpacked -> Blackmagic's installer
+install_linux_run() {
+    local version="$1"
+    local zip_path="${BUILD_DIR}/DaVinci_Resolve_${version}_Linux.zip"
+    local extract_dir="${BUILD_DIR}/extract"
+
+    log "Extracting $(basename "$zip_path")..."
+    rm -rf "$extract_dir"
+    mkdir -p "$extract_dir"
+    # Don't leave ~13GB of unpacked installer behind if any step below fails
+    trap 'rm -rf "'"$extract_dir"'"' EXIT
+    unzip -q "$zip_path" -d "$extract_dir"
+
+    local run
+    run=$(find "$extract_dir" -maxdepth 1 -name '*.run' | head -1)
+    if [[ -z "$run" ]]; then
+        err "No .run installer found in $(basename "$zip_path")"
+        return 1
+    fi
+
+    # Unpack the AppImage (as the AUR PKGBUILD does) instead of running it, so FUSE isn't needed
+    log "Unpacking $(basename "$run") (about 9GB)..."
+    chmod u+x "$run"
+    (cd "$extract_dir" && "$run" --appimage-extract > /dev/null)
+    rm -f "$run"
+    local apprun="${extract_dir}/squashfs-root/AppRun"
+    if [[ ! -x "$apprun" ]]; then
+        err "Unpacking $(basename "$run") did not produce AppRun"
+        return 1
+    fi
+
+    install_run_dependencies "$apprun"
+
+    log "Running Blackmagic's installer (needs your password)..."
+    # SKIP_PACKAGE_CHECK: its list was installed above, and its own check doesn't know the
+    # t64 package names of Ubuntu 24.04+ / Debian 13, so it would refuse to install there.
+    # -i: no GUI, -y: don't ask, -a: allow running as root (it runs under sudo)
+    sudo env SKIP_PACKAGE_CHECK=1 "$apprun" -i -y -a
+    rm -rf "$extract_dir"
+    trap - EXIT
+
+    # AppRun exits 0 even when its installer fails, so check what actually got installed
+    local now
+    now=$(get_installed_version)
+    if [[ "$now" != "$version" ]]; then
+        err "Installer finished, but /opt/resolve reports version ${now} instead of ${version}"
+        return 1
+    fi
+    ok "Installed DaVinci Resolve ${version} to /opt/resolve"
 }
 
 # Step 4: Fetch and update PKGBUILD
@@ -582,9 +850,208 @@ check_runtime_dirs() {
         echo "      sudo mkdir -p '${resolve_dir}/${d}' && sudo chown $(id -un):$(id -gn) '${resolve_dir}/${d}'"
     done
     echo ""
+    local launcher="davinci-resolve"  # AUR package wrapper; Blackmagic's installer has none
+    [[ "$LINUX_FAMILY" == "arch" ]] || launcher="/opt/resolve/bin/resolve"
     echo "  If it still fails, find the next one with:"
-    echo "      strace -f -e trace=mkdir,mkdirat davinci-resolve 2>&1 | grep -E 'EACCES|EPERM'"
+    echo "      strace -f -e trace=mkdir,mkdirat ${launcher} 2>&1 | grep -E 'EACCES|EPERM'"
     echo ""
+}
+
+# --- Automatic update checks (Linux, systemd user timer) ---
+#
+# The timer runs `update-resolve.sh --timer` daily/weekly/monthly. On Arch it builds the
+# new package into a local pacman repo, so a normal `pacman -Syu` / `yay -Syu` (or a GUI
+# updater) installs it. Other distros have no package to hand to their package manager
+# (Blackmagic's installer registers none), so there the timer only notifies.
+
+LOCAL_REPO_NAME="resolve-local"
+# /var/lib, not /var/cache: cache cleaners may wipe /var/cache, and a missing repo
+# directory makes every `pacman -Syu` fail
+LOCAL_REPO_DIR="/var/lib/${LOCAL_REPO_NAME}"
+SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+
+# Desktop notification when possible; the text also lands in the journal
+notify() {
+    echo "$1: $2"
+    command -v notify-send &>/dev/null && notify-send -a "DaVinci Resolve Updater" "$1" "$2" 2>/dev/null || true
+}
+
+write_timer_units() {
+    local interval="$1"
+    mkdir -p "$SYSTEMD_USER_DIR"
+    cat > "${SYSTEMD_USER_DIR}/resolve-update.service" <<EOF
+[Unit]
+Description=Check for DaVinci Resolve updates
+
+[Service]
+Type=oneshot
+ExecStart="${SCRIPT_DIR}/update-resolve.sh" --timer
+Nice=10
+IOSchedulingClass=idle
+EOF
+    cat > "${SYSTEMD_USER_DIR}/resolve-update.timer" <<EOF
+[Unit]
+Description=Check for DaVinci Resolve updates (${interval})
+
+[Timer]
+OnCalendar=${interval}
+# Catch up on a check missed while the computer was off
+Persistent=true
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+setup_timer() {
+    local interval="$1" have_systemd=true
+    command -v systemctl &>/dev/null && systemctl --user show-environment &>/dev/null || have_systemd=false
+
+    if [[ "$interval" == "never" ]]; then
+        if [[ -f "${SYSTEMD_USER_DIR}/resolve-update.timer" ]]; then
+            [[ "$have_systemd" == "false" ]] || systemctl --user disable --now resolve-update.timer 2>/dev/null || true
+            # Without a user session (e.g. over SSH) disable can't run, so remove its link too
+            rm -f "${SYSTEMD_USER_DIR}/resolve-update."{service,timer} \
+                  "${SYSTEMD_USER_DIR}/timers.target.wants/resolve-update.timer"
+            [[ "$have_systemd" == "false" ]] || systemctl --user daemon-reload
+            ok "Removed the automatic update check"
+        fi
+        return 0
+    fi
+
+    if [[ "$have_systemd" == "false" ]]; then
+        warn "No systemd user session here; skipping the automatic update check"
+        return 0
+    fi
+
+    [[ "$LINUX_FAMILY" != "arch" ]] || setup_local_repo
+    write_timer_units "$interval"
+    systemctl --user daemon-reload
+    systemctl --user enable --now resolve-update.timer
+    ok "Checking for updates ${interval} (systemctl --user list-timers resolve-update.timer)"
+    if [[ "$LINUX_FAMILY" == "arch" ]]; then
+        log "New versions are built in the background; install them with: sudo pacman -Syu"
+    else
+        log "You'll get a notification when an update is available"
+    fi
+}
+
+# One-time (sudo): a directory you own for built packages, registered in pacman.conf.
+# It starts as an empty but valid repo, so `pacman -Sy` works before the first build.
+setup_local_repo() {
+    local db="${LOCAL_REPO_DIR}/${LOCAL_REPO_NAME}.db.tar.gz"
+    if [[ ! -d "$LOCAL_REPO_DIR" || ! -w "$LOCAL_REPO_DIR" ]]; then
+        log "Creating local package repo ${LOCAL_REPO_DIR} (needs your password)..."
+        sudo install -d -o "$(id -un)" -g "$(id -gn)" -m 755 "$LOCAL_REPO_DIR"
+    fi
+    if [[ ! -e "$db" ]]; then
+        # Both databases, so `pacman -Sy` and `pacman -Fy` work before the first build
+        local f
+        for f in db files; do
+            bsdtar -czf "${LOCAL_REPO_DIR}/${LOCAL_REPO_NAME}.${f}.tar.gz" -T /dev/null
+            ln -sf "${LOCAL_REPO_NAME}.${f}.tar.gz" "${LOCAL_REPO_DIR}/${LOCAL_REPO_NAME}.${f}"
+        done
+    fi
+    if ! grep -q "^\[${LOCAL_REPO_NAME}\]" /etc/pacman.conf; then
+        log "Adding [${LOCAL_REPO_NAME}] to /etc/pacman.conf (needs your password)..."
+        printf '\n# DaVinci Resolve builds from update-resolve.sh\n[%s]\nSigLevel = Optional TrustAll\nServer = file://%s\n' \
+            "$LOCAL_REPO_NAME" "$LOCAL_REPO_DIR" | sudo tee -a /etc/pacman.conf > /dev/null
+    fi
+    ok "Local package repo ready: [${LOCAL_REPO_NAME}] in /etc/pacman.conf"
+}
+
+# Path of the built package for version $1, if the repo's database lists it. A package
+# file without a database entry (an interrupted publish) doesn't count.
+local_repo_package() {
+    local db="${LOCAL_REPO_DIR}/${LOCAL_REPO_NAME}.db.tar.gz" entries entry file
+    [[ -f "$db" ]] || return 1
+    entries=$(bsdtar -tf "$db" 2>/dev/null) || return 1
+    entry=$(grep -m1 -E "^${PRODUCT}-${1//./\\.}-[^/-]+/\$" <<< "$entries") || return 1
+    file=$(bsdtar -xOf "$db" "${entry}desc" | awk 'f { print; exit } /^%FILENAME%$/ { f = 1 }')
+    [[ -n "$file" && -f "${LOCAL_REPO_DIR}/${file}" ]] || return 1
+    echo "${LOCAL_REPO_DIR}/${file}"
+}
+
+# Move the packages makepkg just built into the local repo; -R drops the old versions
+publish_local_repo() {
+    local pkgs=() p
+    # --packagelist also names a -debug package that makepkg only builds when there are
+    # symbols to split, so publish what actually exists, but insist on the main package
+    while read -r p; do
+        [[ -f "$p" ]] && pkgs+=("$p")
+    done < <(cd "$BUILD_DIR" && makepkg --packagelist)
+    if ! printf '%s\n' "${pkgs[@]##*/}" | grep -q "^${PRODUCT}-[0-9]"; then
+        err "makepkg did not produce a ${PRODUCT} package in ${BUILD_DIR}"
+        return 1
+    fi
+    mv -f "${pkgs[@]}" "$LOCAL_REPO_DIR/"
+    (cd "$LOCAL_REPO_DIR" && repo-add -q -R "${LOCAL_REPO_NAME}.db.tar.gz" "${pkgs[@]##*/}")
+    # The unpacked build tree is ~2x the package; the next run starts from scratch anyway
+    rm -rf "${BUILD_DIR}/src" "${BUILD_DIR}/pkg"
+    ok "Published to [${LOCAL_REPO_NAME}]: ${pkgs[*]##*/}"
+}
+
+# Dependencies of the PKGBUILD in BUILD_DIR that aren't installed (pacman -T lists them)
+missing_build_deps() {
+    (cd "$BUILD_DIR" && makepkg --printsrcinfo) \
+        | sed -n -E 's/^\t(make|check)?depends = //p' | xargs -r pacman -T || true
+}
+
+# Unattended run from the systemd timer
+run_timer() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        err "No ${CONFIG_FILE}; run update-resolve.sh once interactively first"
+        exit 1
+    fi
+    # Report any failure as a notification, not only in the journal
+    set -o errtrace
+    trap 'notify "DaVinci Resolve update failed" "See: journalctl --user -u resolve-update"' ERR
+
+    local installed latest_info latest download_id
+    installed=$(get_installed_version)
+    # Offline (e.g. just after boot): try again next time instead of reporting a failure
+    if ! latest_info=$(get_latest_version 2>/dev/null); then
+        log "Blackmagic API unreachable; skipping this check"
+        exit 0
+    fi
+    latest=${latest_info%%|*}
+    download_id=${latest_info#*|}
+    if [[ "$installed" == "$latest" ]]; then
+        log "Up to date (${installed})"
+        exit 0
+    fi
+
+    if [[ "$LINUX_FAMILY" != "arch" ]]; then
+        notify "DaVinci Resolve ${latest} is available" "Installed: ${installed}. Update with: ${SCRIPT_DIR}/update-resolve.sh"
+        exit 0
+    fi
+
+    if local_repo_package "$latest" > /dev/null; then
+        log "${latest} is already built in [${LOCAL_REPO_NAME}]; waiting for pacman -Syu"
+        exit 0
+    fi
+
+    load_config
+    mkdir -p "$BUILD_DIR"
+    download_resolve "$download_id" "$latest"
+    setup_pkgbuild "$latest"
+
+    # `makepkg -s` would need sudo for missing dependencies, which a background run
+    # can't give (e.g. `makepkg -sric` removed patchelf after the last interactive build)
+    local missing
+    missing=$(missing_build_deps)
+    if [[ -n "$missing" ]]; then
+        notify "DaVinci Resolve ${latest} needs packages" \
+            "Missing: $(echo $missing). Run ${SCRIPT_DIR}/update-resolve.sh once to build and install it."
+        exit 0
+    fi
+
+    SKIP_INSTALL=true
+    build_and_install
+    publish_local_repo
+    cleanup_zip "$latest"
+    notify "DaVinci Resolve ${latest} is ready" "Install it with: sudo pacman -Syu"
 }
 
 # --- Main ---
@@ -622,21 +1089,58 @@ check_tools_linux() {
     done
 }
 
+check_tools_run() {
+    local missing=() cmd
+    for cmd in curl jq unzip; do
+        command -v "$cmd" &>/dev/null || missing+=("$cmd")
+    done
+    [[ ${#missing[@]} -gt 0 ]] || return 0
+
+    log "Installing missing tools: ${missing[*]}"
+    case "$LINUX_FAMILY" in
+        deb)  sudo apt-get update && sudo apt-get install -y "${missing[@]}" ;;
+        rpm)  if command -v dnf &>/dev/null; then sudo dnf install -y "${missing[@]}"
+              else sudo yum install -y "${missing[@]}"; fi ;;
+        suse) sudo zypper --non-interactive install "${missing[@]}" ;;
+        *)    err "Missing dependency: ${missing[*]}. Install it and re-run."; exit 1 ;;
+    esac
+}
+
 main() {
     echo ""
     echo -e "${BLUE}╔══════════════════════════════════════════╗${NC}"
     if [[ "$PLATFORM" == "mac" ]]; then
         echo -e "${BLUE}║    DaVinci Resolve Updater for macOS     ║${NC}"
-    else
+    elif [[ "$LINUX_FAMILY" == "arch" ]]; then
         echo -e "${BLUE}║  DaVinci Resolve Updater for Arch Linux  ║${NC}"
+    else
+        echo -e "${BLUE}║    DaVinci Resolve Updater for Linux     ║${NC}"
     fi
     echo -e "${BLUE}╚══════════════════════════════════════════╝${NC}"
     echo ""
 
     if [[ "$PLATFORM" == "mac" ]]; then
         check_tools_mac
-    else
+    elif [[ "$LINUX_FAMILY" == "arch" ]]; then
         check_tools_linux
+    else
+        check_tools_run
+    fi
+
+    # One run at a time on Linux: the timer and an interactive run share build/
+    if [[ "$PLATFORM" == "linux" && "$CHECK_ONLY" != "true" ]] && command -v flock &>/dev/null; then
+        exec 9> "${SCRIPT_DIR}/.lock"
+        if ! flock -n 9; then
+            [[ "$TIMER" != "true" ]] || { log "Another run is in progress; skipping this check"; exit 0; }
+            err "Another update-resolve.sh run is in progress (perhaps the timer). Try again when it's done."
+            exit 1
+        fi
+    fi
+
+    if [[ "$TIMER" == "true" ]]; then
+        [[ "$PLATFORM" == "linux" ]] || { err "--timer is for Linux; on macOS use the Homebrew cask"; exit 1; }
+        run_timer
+        exit 0
     fi
 
     # Registration is only needed to download, so --check-only and up-to-date runs
@@ -658,6 +1162,14 @@ main() {
 
     # Compare versions
     if [[ "$installed_version" == "$latest_version" && "$FORCE" != "true" ]]; then
+        # Just chose Homebrew in --reconfigure: install the cask now, so Homebrew tracks
+        # this version and `brew upgrade` takes over future updates
+        if [[ "$PLATFORM" == "mac" && "${USE_HOMEBREW:-}" == "yes" && "$CHECK_ONLY" != "true" ]] \
+            && ! brew list --cask "$HOMEBREW_CASK" &>/dev/null; then
+            log "Resolve is up to date; installing it as a Homebrew cask so brew upgrade handles future updates"
+            update_via_homebrew
+            exit 0
+        fi
         ok "Already on latest version (${installed_version}). Nothing to do."
         if [[ "$CHECK_ONLY" == "true" ]]; then
             exit 0
@@ -678,6 +1190,20 @@ main() {
 
     [[ -n "${REG_DATA:-}" ]] || load_config
 
+    if [[ "$PLATFORM" == "mac" && "$USE_HOMEBREW" == "yes" ]]; then
+        update_via_homebrew
+        local now
+        now=$(get_installed_version)
+        echo ""
+        if [[ "$now" == "$latest_version" ]]; then
+            ok "DaVinci Resolve ${latest_version} installed successfully (via Homebrew)!"
+        else
+            # The cask is bumped from Blackmagic's API every 6 hours by the tap's GitHub Action
+            warn "Homebrew's cask isn't on ${latest_version} yet (installed: ${now}); it's updated every 6 hours, try again later"
+        fi
+        exit 0
+    fi
+
     if [[ "$PLATFORM" == "mac" ]]; then
         mkdir -p "$BUILD_DIR"
         download_resolve "$download_id" "$latest_version"
@@ -693,6 +1219,39 @@ main() {
         echo ""
         ok "DaVinci Resolve ${latest_version} installed successfully!"
         log "Launch it from /Applications/DaVinci Resolve."
+        exit 0
+    fi
+
+    if [[ "$LINUX_FAMILY" != "arch" ]]; then
+        mkdir -p "$BUILD_DIR"
+        download_resolve "$download_id" "$latest_version"
+
+        if [[ "$SKIP_INSTALL" == "true" ]]; then
+            ok "Downloaded to ${BUILD_DIR} (not installed due to --skip-install)"
+            exit 0
+        fi
+
+        install_linux_run "$latest_version"
+        check_runtime_dirs
+        cleanup_zip "$latest_version"
+
+        echo ""
+        ok "DaVinci Resolve ${latest_version} installed successfully!"
+        log "Launch it from your app menu or with /opt/resolve/bin/resolve"
+        exit 0
+    fi
+
+    # The timer may already have built this version: install that instead of rebuilding.
+    # pacman -U installs just this file, so it's no partial upgrade like `pacman -Sy <pkg>`.
+    local built
+    if [[ "$SKIP_INSTALL" != "true" && "$FORCE" != "true" ]] && built=$(local_repo_package "$latest_version"); then
+        log "The timer already built ${latest_version}; installing it from [${LOCAL_REPO_NAME}]"
+        sudo pacman -U --noconfirm "$built"
+        check_runtime_dirs
+        cleanup_zip "$latest_version"
+        echo ""
+        ok "DaVinci Resolve ${latest_version} installed successfully!"
+        log "Run 'davinci-resolve' to launch."
         exit 0
     fi
 

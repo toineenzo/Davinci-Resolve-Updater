@@ -3,3 +3,6 @@ build/
 
 # Registration info written by --reconfigure (name/email/phone/address) — never commit
 .config
+
+# Held while a run is in progress (Linux), so the timer and a manual run never share build/
+.lock
