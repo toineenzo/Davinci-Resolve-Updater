@@ -15,6 +15,24 @@ cd Davinci-Resolve-Updater
 
 On macOS the script reads the installed version from `/Applications/DaVinci Resolve/DaVinci Resolve.app`, asks Blackmagic's API for the latest Mac build, downloads the zip, mounts the `.dmg` inside it and runs the bundled `.pkg` with `sudo installer` (with a live progress line). Needs only built-in tools plus `jq` (built in on macOS 15+, otherwise `brew install jq`). Set `PRODUCT="davinci-resolve-studio"` at the top for Studio. Test: `./tests/test-mac-install.sh`.
 
+### Homebrew (auto-update with `brew upgrade` / Updatest)
+
+This repo is also a Homebrew tap with a `davinci-resolve` cask, so Resolve updates along with everything else:
+
+```bash
+brew tap toineenzo/resolve https://github.com/toineenzo/Davinci-Resolve-Updater
+brew trust toineenzo/resolve   # Homebrew 7+ only loads casks from trusted taps
+"$(brew --repo toineenzo/resolve)/update-resolve.sh" --reconfigure --check-only   # save registration info once
+brew install --cask toineenzo/resolve/davinci-resolve
+```
+
+After that, `brew update && brew upgrade` (or Updatest) installs new Resolve releases. A GitHub Action ([bump-cask.yml](.github/workflows/bump-cask.yml)) checks Blackmagic's API every 6 hours and bumps the cask version.
+
+- **Downloads:** Blackmagic hands out signed URLs after a registration POST. A small download strategy ([lib/](lib/blackmagic_download_strategy.rb)) does that at download time, using the `.config` saved by the command above, in the tap folder. To use another file instead, set `HOMEBREW_RESOLVE_CONFIG=/path/to/.config`.
+- **Password:** installing the `.pkg` needs `sudo`, so `brew install`/`upgrade` asks for your password.
+- **`brew uninstall`** only forgets the cask; use `/Applications/DaVinci Resolve/Uninstall Resolve.app`. This is on purpose: Homebrew runs a cask's uninstall step before every upgrade, which would delete Resolve before installing the new version.
+- **Use one method:** either the cask or `update-resolve.sh`. Updating with the script leaves Homebrew's recorded version behind.
+
 The rest of this README covers Arch Linux.
 
 **Script version:** 2026.10.1 | **Tested with DaVinci Resolve:** 21.1.2-1

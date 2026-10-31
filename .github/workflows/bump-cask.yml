@@ -1,0 +1,53 @@
+# Keeps Casks/davinci-resolve.rb on Blackmagic's latest Mac release, so a plain
+# `brew update && brew upgrade` (or Updatest) sees new versions without anyone
+# editing the cask by hand.
+name: Bump DaVinci Resolve cask
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update version and download ID from Blackmagic's API
+        id: bump
+        run: |
+          set -euo pipefail
+          latest=$(curl -fsS https://www.blackmagicdesign.com/api/support/latest-stable-version/davinci-resolve/mac)
+          version=$(jq -r '.mac | "\(.major).\(.minor).\(.releaseNum)"' <<< "$latest")
+          download_id=$(jq -r '.mac.downloadId' <<< "$latest")
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$download_id" =~ ^[0-9a-f]{32}$ ]] || {
+            echo "Unexpected API response: $latest" >&2; exit 1; }
+
+          cask=Casks/davinci-resolve.rb
+          current=$(sed -n 's/^  version "\(.*\)"$/\1/p' "$cask")
+          if [[ "$current" == "$version" ]]; then
+            echo "Already at $version"
+            exit 0
+          fi
+          # Never go backwards if the API briefly reports an older build
+          if [[ "$(printf '%s\n%s\n' "$current" "$version" | sort -V | tail -1)" != "$version" ]]; then
+            echo "API reports $version, older than $current; leaving cask alone"
+            exit 0
+          fi
+
+          sed -i -e "s/^  version \".*\"$/  version \"$version\"/" \
+                 -e "s#/api/register/us/download/[0-9a-f]\{32\}#/api/register/us/download/$download_id#" "$cask"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Bumped $current -> $version"
+
+      - name: Commit
+        if: steps.bump.outputs.version
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "davinci-resolve ${{ steps.bump.outputs.version }}"
+          git push
