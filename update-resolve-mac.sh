@@ -209,7 +209,12 @@ install_resolve() {
 
     log "Mounting $(basename "$dmg")..."
     mkdir -p "$mount_dir"
-    hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mount_dir" > /dev/null
+    # `diskutil image` replaces `hdiutil attach` (deprecated on newer macOS); older macOS lacks it
+    if diskutil image &>/dev/null; then
+        diskutil image attach --readOnly --nobrowse --mountPoint "$mount_dir" "$dmg" > /dev/null
+    else
+        hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mount_dir" > /dev/null
+    fi
     trap 'hdiutil detach "'"$mount_dir"'" -quiet 2>/dev/null || true' EXIT
 
     local pkg
@@ -225,7 +230,18 @@ install_resolve() {
     fi
 
     log "Installing $(basename "$pkg") (needs your password)..."
-    sudo installer -pkg "$pkg" -target /
+    # -verboseR emits machine-readable "installer:%NN.N" / "installer:PHASE:..." lines;
+    # turn them into one live status line instead of minutes of silence
+    local pct=0 phase="Starting"
+    sudo installer -pkg "$pkg" -target / -verboseR | while IFS= read -r line; do
+        case $line in
+            installer:%*) pct=${line#installer:%}; pct=${pct%%.*} ;;
+            installer:PHASE:*) phase=${line#installer:PHASE:} ;;
+            *) continue ;;
+        esac
+        printf '\r\033[K    %3d%%  %s' "$pct" "$phase"
+    done
+    echo ""
 
     hdiutil detach "$mount_dir" -quiet
     trap - EXIT

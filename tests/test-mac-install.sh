@@ -26,7 +26,7 @@ PATH="${work}/bin:${PATH}" install_resolve "99.0.0" > /dev/null
 
 called=$(cat "${work}/called")
 rm -rf "$work"
-if [[ "$called" == "installer -pkg "*"/Install Resolve 99.0.0.pkg -target /" ]]; then
+if [[ "$called" == "installer -pkg "*"/Install Resolve 99.0.0.pkg -target / -verboseR" ]]; then
     echo -e "${GREEN}PASS${NC} install_resolve runs installer on the .pkg inside the dmg"
 else
     echo -e "${RED}FAIL${NC} unexpected call: ${called}"
