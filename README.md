@@ -26,7 +26,7 @@ brew trust toineenzo/resolve   # Homebrew 7+ only loads casks from trusted taps
 brew install --cask toineenzo/resolve/davinci-resolve
 ```
 
-After that, `brew update && brew upgrade` (or Updatest) installs new Resolve releases. A GitHub Action ([bump-cask.yml](.github/workflows/bump-cask.yml)) checks Blackmagic's API every 6 hours and bumps the cask version.
+After that, `brew update && brew upgrade` (or Updatest) installs new Resolve releases. A GitHub Action ([bump-cask.yml](.github/workflows/bump-cask.yml)) checks Blackmagic's API every 6 hours and bumps the cask version. Blackmagic publishes no checksum, so for each new release the Action downloads the zip once to compute its sha256. That download needs the registration form, filled from the repository secrets `BMD_FIRSTNAME`, `BMD_LASTNAME`, `BMD_EMAIL`, `BMD_PHONE`, `BMD_COUNTRY`, `BMD_STATE`, `BMD_CITY` and `BMD_STREET`. Without them the cask is still bumped, but with `sha256 :no_check`.
 
 - **Downloads:** Blackmagic hands out signed URLs after a registration POST. A small download strategy ([lib/](lib/blackmagic_download_strategy.rb)) does that at download time, using the `.config` saved by the command above, in the tap folder. To use another file instead, set `HOMEBREW_RESOLVE_CONFIG=/path/to/.config`.
 - **Password:** installing the `.pkg` needs `sudo`, so `brew install`/`upgrade` asks for your password.

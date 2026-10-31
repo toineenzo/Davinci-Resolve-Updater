@@ -1,12 +1,22 @@
 # Keeps Casks/davinci-resolve.rb on Blackmagic's latest Mac release, so a plain
 # `brew update && brew upgrade` (or Updatest) sees new versions without anyone
 # editing the cask by hand.
+#
+# Blackmagic publishes no checksum, so each new release is downloaded once
+# (streamed, ~4 GB, not stored) to compute its sha256. The download needs the
+# registration form, filled from the BMD_* repository secrets. Without them the
+# cask is still bumped, but with `sha256 :no_check`.
 name: Bump DaVinci Resolve cask
 
 on:
   schedule:
     - cron: "17 */6 * * *"
   workflow_dispatch:
+    inputs:
+      rehash:
+        description: "Recompute sha256 even if the version is unchanged"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -17,8 +27,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Update version and download ID from Blackmagic's API
-        id: bump
+      - name: Check Blackmagic's API for a new version
+        id: check
+        env:
+          REHASH: ${{ inputs.rehash }}
         run: |
           set -euo pipefail
           latest=$(curl -fsS https://www.blackmagicdesign.com/api/support/latest-stable-version/davinci-resolve/mac)
@@ -27,9 +39,8 @@ jobs:
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$download_id" =~ ^[0-9a-f]{32}$ ]] || {
             echo "Unexpected API response: $latest" >&2; exit 1; }
 
-          cask=Casks/davinci-resolve.rb
-          current=$(sed -n 's/^  version "\(.*\)"$/\1/p' "$cask")
-          if [[ "$current" == "$version" ]]; then
+          current=$(sed -n 's/^  version "\(.*\)"$/\1/p' Casks/davinci-resolve.rb)
+          if [[ "$current" == "$version" && "$REHASH" != "true" ]]; then
             echo "Already at $version"
             exit 0
           fi
@@ -38,16 +49,65 @@ jobs:
             echo "API reports $version, older than $current; leaving cask alone"
             exit 0
           fi
-
-          sed -i -e "s/^  version \".*\"$/  version \"$version\"/" \
-                 -e "s#/api/register/us/download/[0-9a-f]\{32\}#/api/register/us/download/$download_id#" "$cask"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "Bumped $current -> $version"
+          echo "download_id=$download_id" >> "$GITHUB_OUTPUT"
+          echo "current=$current" >> "$GITHUB_OUTPUT"
 
-      - name: Commit
-        if: steps.bump.outputs.version
+      - name: Download once to compute sha256
+        id: hash
+        if: steps.check.outputs.version
+        env:
+          DOWNLOAD_ID: ${{ steps.check.outputs.download_id }}
+          BMD_FIRSTNAME: ${{ secrets.BMD_FIRSTNAME }}
+          BMD_LASTNAME: ${{ secrets.BMD_LASTNAME }}
+          BMD_EMAIL: ${{ secrets.BMD_EMAIL }}
+          BMD_PHONE: ${{ secrets.BMD_PHONE }}
+          BMD_COUNTRY: ${{ secrets.BMD_COUNTRY }}
+          BMD_STATE: ${{ secrets.BMD_STATE }}
+          BMD_CITY: ${{ secrets.BMD_CITY }}
+          BMD_STREET: ${{ secrets.BMD_STREET }}
         run: |
+          set -euo pipefail
+          if [[ -z "$BMD_FIRSTNAME" || -z "$BMD_EMAIL" ]]; then
+            echo "::warning::BMD_* secrets not set; bumping with sha256 :no_check"
+            echo "sha256=:no_check" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          payload=$(jq -n --arg fn "$BMD_FIRSTNAME" --arg ln "$BMD_LASTNAME" --arg em "$BMD_EMAIL" \
+            --arg ph "$BMD_PHONE" --arg co "$BMD_COUNTRY" --arg st "$BMD_STATE" --arg ci "$BMD_CITY" \
+            --arg sr "$BMD_STREET" \
+            '{firstname:$fn, lastname:$ln, email:$em, phone:$ph, country:$co, state:$st, city:$ci, street:$sr, product:"DaVinci Resolve"}')
+          ua="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+          url=$(curl -fsS -X POST "https://www.blackmagicdesign.com/api/register/us/download/${DOWNLOAD_ID}" \
+            -H "Content-Type: application/json;charset=UTF-8" \
+            -H "Origin: https://www.blackmagicdesign.com" \
+            -H "Referer: https://www.blackmagicdesign.com/support/download/77ef91f67a9e411bbbe299e595b4cfcc/Mac%20OS%20X" \
+            -H "User-Agent: $ua" -d "$payload")
+          [[ "$url" == https://* ]] || { echo "Blackmagic refused the download request: $url" >&2; exit 1; }
+          sha=$(curl -fsSL -H "User-Agent: $ua" "$url" | sha256sum | cut -d' ' -f1)
+          [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || { echo "Bad sha256: $sha" >&2; exit 1; }
+          echo "sha256 $sha"
+          echo "sha256=\"$sha\"" >> "$GITHUB_OUTPUT"
+
+      - name: Update cask and commit
+        if: steps.check.outputs.version
+        env:
+          VERSION: ${{ steps.check.outputs.version }}
+          DOWNLOAD_ID: ${{ steps.check.outputs.download_id }}
+          CURRENT: ${{ steps.check.outputs.current }}
+          SHA256: ${{ steps.hash.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          cask=Casks/davinci-resolve.rb
+          sed -i -e "s/^  version \".*\"$/  version \"$VERSION\"/" \
+                 -e "s/^  sha256 .*$/  sha256 $SHA256/" \
+                 -e "s#/api/register/us/download/[0-9a-f]\{32\}#/api/register/us/download/$DOWNLOAD_ID#" "$cask"
+          if git diff --quiet; then
+            echo "Cask already matches $VERSION ($SHA256)"
+            exit 0
+          fi
+          git diff
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -am "davinci-resolve ${{ steps.bump.outputs.version }}"
+          git commit -am "davinci-resolve $VERSION"
           git push
