@@ -1,6 +1,19 @@
 # update-resolve
 
-Automated DaVinci Resolve updater for Arch Linux.
+Automated DaVinci Resolve updater for Arch Linux and macOS.
+
+## macOS
+
+```bash
+git clone https://github.com/toineenzo/Davinci-Resolve-Updater.git
+cd Davinci-Resolve-Updater
+./update-resolve-mac.sh               # check, download, install
+./update-resolve-mac.sh --check-only  # just compare installed vs latest
+```
+
+`update-resolve-mac.sh` reads the installed version from `/Applications/DaVinci Resolve/DaVinci Resolve.app`, asks Blackmagic's API for the latest Mac build, downloads the zip (same registration prompt as Linux), mounts the `.dmg` inside it and runs the bundled `.pkg` with `sudo installer`. Flags are the same as the Linux script (`--force`, `--check-only`, `--skip-install`, `--reconfigure`). Needs only built-in tools plus `jq` (built in on macOS 15+, otherwise `brew install jq`). Set `PRODUCT="davinci-resolve-studio"` at the top for Studio. Test: `./tests/test-mac-install.sh`.
+
+The rest of this README covers the Arch Linux script.
 
 **Script version:** 2026.10.1 | **Tested with DaVinci Resolve:** 21.1.2-1
 
