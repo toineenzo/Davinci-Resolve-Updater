@@ -1,4 +1,4 @@
-# update-resolve
+# Davinci Resolve Updater for macOS and Linux
 
 `update-resolve.sh` checks Blackmagic's API for the latest DaVinci Resolve release, compares it with the version you have installed, and if there is a newer one, downloads it (it fills in Blackmagic's registration form for you) and installs it. One script covers Arch Linux, other Linux distros and macOS. It detects the OS and picks the install route. The same command and registration prompt work on every platform. A few flags are platform-specific (`--timer` is Linux-only, see [Usage and flags](#usage-and-flags)), and each platform gets one extra setup question.
 
