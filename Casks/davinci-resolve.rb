@@ -3,10 +3,10 @@ require_relative "../lib/blackmagic_download_strategy"
 cask "davinci-resolve" do
   # Bumped automatically by .github/workflows/bump-cask.yml from Blackmagic's API.
   # Blackmagic publishes no checksum; the workflow downloads each release once to compute it.
-  version "21.1.2"
-  sha256 "ddfd42ad960c32254752b5e68bc9e3021820ca2200a53a99c38848e110aa32f0"
+  version "21.2.0"
+  sha256 "9511b293abd4996f5b4101c96fbd652bf75fc470df76a54f62fca1dc9ab0d969"
 
-  url "https://www.blackmagicdesign.com/api/register/us/download/cef11ad119494da5a908b9a05b332cc7",
+  url "https://www.blackmagicdesign.com/api/register/us/download/0c2e03fcd586438bae0d268fbc3ad477",
       using: BlackmagicDownloadStrategy
   name "DaVinci Resolve"
   desc "Video editing, colour grading, VFX and audio post-production (free edition)"
