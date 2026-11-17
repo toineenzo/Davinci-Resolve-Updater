@@ -1,10 +1,10 @@
-# Davinci Resolve Updater for macOS and Linux
+# Davinci Resolve Updater for macOS, Linux and Windows
 
-`update-resolve.sh` checks Blackmagic's API for the latest DaVinci Resolve release, compares it with the version you have installed, and if there is a newer one, downloads it (it fills in Blackmagic's registration form for you) and installs it. One script covers Arch Linux, other Linux distros and macOS. It detects the OS and picks the install route. The same command and registration prompt work on every platform. A few flags are platform-specific (`--timer` is Linux-only, see [Usage and flags](#usage-and-flags)), and each platform gets one extra setup question.
+`update-resolve.sh` checks Blackmagic's API for the latest DaVinci Resolve release, compares it with the version you have installed, and if there is a newer one, downloads it (it fills in Blackmagic's registration form for you) and installs it. One script covers Arch Linux, other Linux distros, macOS and Windows (in Git Bash). It detects the OS and picks the install route. The same command and registration prompt work on every platform. A few flags are platform-specific (`--timer` is for Linux and Windows, see [Usage and flags](#usage-and-flags)), and each platform gets one extra setup question.
 
-This is a fork of [drake495/Davinci-Resolve-Updater](https://github.com/drake495/Davinci-Resolve-Updater), which supports Arch Linux only. The Arch route works the same way as upstream. This fork adds macOS, other Linux distros, a Homebrew tap and automatic update checks.
+This is a fork of [drake495/Davinci-Resolve-Updater](https://github.com/drake495/Davinci-Resolve-Updater), which supports Arch Linux only. The Arch route works the same way as upstream. This fork adds macOS, Windows, other Linux distros, a Homebrew tap and automatic update checks.
 
-**Script version:** 2026.10.2 | **Tested with DaVinci Resolve:** 21.1.2-1
+**Script version:** 2026.11.0 | **Tested with DaVinci Resolve:** 21.1.2-1
 
 ## Contents
 
@@ -14,7 +14,8 @@ This is a fork of [drake495/Davinci-Resolve-Updater](https://github.com/drake495
 - [macOS](#macos)
 - [Linux: Arch](#linux-arch)
 - [Linux: other distros](#linux-other-distros)
-- [Automatic update checks (Linux)](#automatic-update-checks-linux)
+- [Windows](#windows)
+- [Automatic update checks](#automatic-update-checks)
 - [Configuration file reference](#configuration-file-reference)
 - [DaVinci Resolve Studio](#davinci-resolve-studio)
 - [How it works](#how-it-works)
@@ -27,6 +28,7 @@ This is a fork of [drake495/Davinci-Resolve-Updater](https://github.com/drake495
 
 Before you start:
 
+- **Windows: Git Bash.** On Windows the script runs in Git Bash, which comes with Git for Windows. Install it with `winget install Git.Git`, then open **Git Bash** from the Start menu and run every command below there (not in PowerShell or Command Prompt). See [Windows](#windows).
 - **git.** Fresh Ubuntu, Debian and Mint desktops and minimal Arch installs don't include it. Install it with `sudo apt install git` (Debian/Ubuntu/Mint), `sudo dnf install git` (Fedora/RHEL), or `sudo pacman -S --needed git base-devel` (Arch, which also needs `base-devel` to build the package). On macOS without Homebrew or the Command Line Tools, run `xcode-select --install` first. Or skip git and use **Code > Download ZIP** on GitHub (then `git pull` won't work; download the zip again to update).
 - **Disk space.** Downloads and unpacking happen in `build/`, next to the script. Measured for Resolve 21.1.2: on other Linux distros about 18GB at the peak (the 4.5GB zip, the 4.5GB `.run` inside it and the 8.6GB unpacked installer), plus 8.6GB for `/opt/resolve`; on macOS about 8GB (the 3.9GB zip and the 4.1GB `.dmg` inside it), plus the installed app. The Arch `makepkg` build unpacks and repackages the same files, so plan for 25-30GB there (an estimate).
 - **GPU driver (Linux).** Resolve needs a GPU compute driver (OpenCL or CUDA). Install your GPU's driver first, for example `nvidia` + `opencl-nvidia`, `rocm-opencl-runtime` (AMD) or `intel-compute-runtime`. The script doesn't pick one for your GPU (see [Runtime dependencies](#runtime-dependencies)).
@@ -48,6 +50,7 @@ To update later, run `./update-resolve.sh` again, or `git pull` first to get the
 | Arch Linux and Arch-based distros (Manjaro, EndeavourOS, …) | Builds the AUR `davinci-resolve` package with `makepkg`. pacman tracks the result. | [Linux: Arch](#linux-arch) |
 | Ubuntu, Debian, Linux Mint, Fedora, Rocky, CentOS Stream, RHEL, openSUSE | Runs Blackmagic's own installer into `/opt/resolve` | [Linux: other distros](#linux-other-distros) |
 | macOS | Runs the `.pkg` from Blackmagic's `.dmg`, or uses the Homebrew cask from this repo | [macOS](#macos) |
+| Windows 10 and 11 (in Git Bash) | Runs Blackmagic's own installer silently, after one Windows admin prompt | [Windows](#windows) |
 
 Don't symlink the script into your `PATH`. It keeps `.config` and `build/` next to the path you call it by, so a symlink in `~/.local/bin` would put them there. Use an alias instead:
 
@@ -57,7 +60,7 @@ alias update-resolve="$HOME/Davinci-Resolve-Updater/update-resolve.sh"
 
 ## What happens on first run
 
-The script only needs your registration info to download, so the setup runs the first time a download is needed, or when you pass `--reconfigure`. If Resolve is already up to date, or you use `--check-only`, you aren't asked for registration info. (On Linux the script may still ask for your sudo password first, to install a missing `curl`, `jq`, `unzip`, `git` or `pacman-contrib`.)
+The script only needs your registration info to download, so the setup runs the first time a download is needed, or when you pass `--reconfigure`. If Resolve is already up to date, or you use `--check-only`, you aren't asked for registration info. (On Linux the script may still ask for your sudo password first, to install a missing `curl`, `jq`, `unzip`, `git` or `pacman-contrib`. On Windows it may install `jq` with winget first.)
 
 **1. Registration info.** Blackmagic asks for this on its download page. The script asks for all of these fields, and all are required:
 
@@ -77,12 +80,12 @@ Street address:
 | Question (exact prompt) | Platform | Options | Default (Enter) | Saved as |
 |---|---|---|---|---|
 | `Delete the downloaded installer zip from build/ after a successful update? [Y/n]:` | all | `y`, `n` | yes | `cleanup_zip=yes` / `no` |
-| `Check for updates automatically with a systemd timer? [d]aily, [w]eekly, [m]onthly or [n]ever [w]:` | Linux | `d`, `w`, `m`, `n` | weekly | `check_interval=daily` / `weekly` / `monthly` / `never` ([details](#automatic-update-checks-linux)) |
+| `Check for updates automatically with a systemd timer? [d]aily, [w]eekly, [m]onthly or [n]ever [w]:` (on Windows: `with Task Scheduler?`) | Linux, Windows | `d`, `w`, `m`, `n` | weekly | `check_interval=daily` / `weekly` / `monthly` / `never` ([details](#automatic-update-checks)) |
 | `Install and update DaVinci Resolve through Homebrew? [Y/n]:` | macOS, only if `brew` is installed | `y`, `n` | yes | `homebrew=yes` / `no` |
 
 - If Homebrew isn't installed, the script doesn't ask and saves `homebrew=no`.
 - If your `.config` is from an older version that lacks one of these keys, the script asks just that question once, on the next run that needs the config, and adds the answer to the file.
-- Without a terminal (cron, the systemd timer) and with no `.config` yet, the script stops with an error.
+- Without a terminal (cron, the systemd timer, Task Scheduler) and with no `.config` yet, the script stops with an error.
 - Without a terminal but with an existing `.config` that lacks one of the newer keys, the script uses `cleanup_zip=yes`, `check_interval=never` and `homebrew=no`. It never creates a timer or switches to Homebrew unattended.
 
 Everything goes into `.config` next to the script, with mode `600`. To change it, edit the file or run `./update-resolve.sh --reconfigure`, which asks every question again. See the [Configuration file reference](#configuration-file-reference).
@@ -95,7 +98,7 @@ Usage: ./update-resolve.sh [--force] [--check-only] [--skip-install] [--reconfig
   --check-only   Just check for updates, don't download or install
   --skip-install Download and build but don't install
   --reconfigure  Re-enter registration info
-  --timer        Unattended check, run by the systemd timer (Linux; see README)
+  --timer        Unattended check, run by the systemd timer or Task Scheduler (see README)
 ```
 
 | Flag | What it does |
@@ -103,9 +106,9 @@ Usage: ./update-resolve.sh [--force] [--check-only] [--skip-install] [--reconfig
 | (none) | Checks the installed version against the latest one and, if they differ, downloads and installs it |
 | `--force` | Installs even when you're on the latest version. It also downloads the zip again, even if one is already in `build/`. On the Homebrew route it runs `brew reinstall --cask`. |
 | `--check-only` | Prints the installed and latest versions, then exits. It doesn't need registration info. |
-| `--skip-install` | Arch: builds the package in `build/` (`makepkg -sf`) without installing it. Other Linux distros and the macOS script route: downloads the zip to `build/` and stops. The zip is always kept. The Homebrew route ignores this flag. |
-| `--reconfigure` | Runs the full first-run setup again and rewrites `.config`. On Linux it also creates, changes or removes the timer to match your answer. |
-| `--timer` | The unattended check that the systemd timer runs. You can also run it by hand. Linux only: on macOS it exits with `--timer is for Linux; on macOS use the Homebrew cask`. |
+| `--skip-install` | Arch: builds the package in `build/` (`makepkg -sf`) without installing it. Other Linux distros, Windows and the macOS script route: downloads the zip to `build/` and stops. The zip is always kept. The Homebrew route ignores this flag. |
+| `--reconfigure` | Runs the full first-run setup again and rewrites `.config`. On Linux and Windows it also creates, changes or removes the automatic check to match your answer. |
+| `--timer` | The unattended check that the systemd timer (Linux) or Task Scheduler (Windows) runs. You can also run it by hand. On macOS it exits with `--timer is for Linux and Windows; on macOS use the Homebrew cask`. |
 | `-h`, `--help` | Prints the usage text shown above |
 
 You can combine flags, for example `./update-resolve.sh --reconfigure --check-only` to save your registration info without installing anything.
@@ -279,14 +282,44 @@ Unpacking needs about 13GB free in `build/` on top of the 4.5GB zip: the 4.5GB `
 
 **Tested distros.** With Resolve 21.1.2, `tests/test-distros.sh` passes in containers for Ubuntu 22.04, Ubuntu 24.04, Linux Mint 22, Debian 12, Debian 13, Fedora 42, Rocky 9, CentOS Stream 9 and openSUSE Leap 15.6: every library Resolve links against is installed and the version is read correctly (see [Testing](#testing)). A full install with Blackmagic's installer was run on Ubuntu 24.04. Launching the GUI with a real GPU hasn't been tested in containers.
 
-## Automatic update checks (Linux)
+## Windows
 
-The setup question (see [What happens on first run](#what-happens-on-first-run)) creates a systemd user timer and saves the interval as `check_interval`. Configs from before this setting get the question once. To change the interval, run `./update-resolve.sh --reconfigure` and answer the timer question; answering `n` removes the timer.
+The script runs in **Git Bash**, the bash that comes with Git for Windows. Install that first:
+
+```powershell
+winget install Git.Git
+```
+
+Then open **Git Bash** from the Start menu and use the [Quick start](#quick-start) commands there. PowerShell, Command Prompt and WSL don't work: in WSL the script sees Linux and would install the Linux version inside WSL.
+
+```bash
+./update-resolve.sh               # check, download, install
+./update-resolve.sh --check-only  # compare installed vs latest
+```
+
+1. Installs `jq` with `winget install jqlang.jq` if it's missing. (`curl` ships with Git Bash and with Windows.)
+2. Reads the installed version from the DaVinci Resolve entry in **Apps & features** (the registry), or else from `C:\Program Files\Blackmagic Design\DaVinci Resolve\Resolve.exe`.
+3. Asks Blackmagic's API for the latest Windows build and downloads `DaVinci_Resolve_<version>_Windows.zip` into `build/`.
+4. Unzips it (with `unzip`, or Windows' own `tar.exe` if Git Bash lacks `unzip`).
+5. If DaVinci Resolve is running, asks you to quit it and press Enter.
+6. Runs the bundled installer silently (`/i /q /noreboot`) with admin rights. Windows shows one admin prompt (UAC); accept it. If the installer asks for a restart, the script tells you to restart Windows.
+7. Checks the installed version again, then deletes the zip from `build/` when `cleanup_zip=yes`.
+
+Requirements: Git Bash (`winget install Git.Git`), `jq` (installed for you through winget), and `powershell.exe`, which ships with Windows.
+
+Resolve is installed to `C:\Program Files\Blackmagic Design\DaVinci Resolve`. Launch it from the Start menu. To remove it, use **Settings > Apps > Installed apps > DaVinci Resolve > Uninstall**.
+
+The Windows route is new and has only been tested with stand-in commands (`tests/test-windows.sh`), not yet with a full install on a Windows machine. If something goes wrong, please open an issue with the script's output.
+
+## Automatic update checks
+
+The setup question (see [What happens on first run](#what-happens-on-first-run)) creates a systemd user timer on Linux (a Task Scheduler task on Windows, see below) and saves the interval as `check_interval`. Configs from before this setting get the question once. To change the interval, run `./update-resolve.sh --reconfigure` and answer the timer question; answering `n` removes the timer.
 
 The timer runs `update-resolve.sh --timer` from where the script is now, with low CPU and I/O priority. It is a user timer, so it only runs while your systemd user instance does, which normally means while you're logged in. A check missed while the computer was off or you were logged out runs the next time you log in. `loginctl enable-linger $USER` keeps it running while you're logged out. Each check is delayed by up to an hour at random. If there is no systemd user session, the script skips the timer with a warning.
 
 - **Arch:** the timer builds new versions in the background and puts them in a local pacman repository, `[resolve-local]`. The packages live in `/var/lib/resolve-local`, and the repo is registered in `/etc/pacman.conf` with `SigLevel = Optional TrustAll` and `Server = file:///var/lib/resolve-local`. A normal `sudo pacman -Syu`, `yay -Syu` or a GUI updater then installs DaVinci Resolve with the rest of your updates, and each new build replaces the previous one in the repo. If you run `./update-resolve.sh` yourself after the timer has built a version, it installs that build with `pacman -U` instead of downloading and building again. Setting this up asks for your password once. The background build can't ask for a password, so if the new version needs packages you don't have, the timer sends `DaVinci Resolve <version> needs packages` and leaves the build to an interactive run.
 - **Other distros:** Blackmagic's installer doesn't create a package your package manager could update. The timer only sends a notification that a new version is available, and you then run `./update-resolve.sh`.
+- **Windows:** instead of a systemd timer, the script creates a Task Scheduler task named `DaVinci Resolve Updater` that runs `update-resolve.sh --timer` in Git Bash at 12:00 (daily, weekly or monthly). A check missed while the computer was off runs when it's back on. It only runs while you're logged in, and opens a Git Bash window while it runs. Like on other distros, it only notifies you (a Windows notification) and you then run `./update-resolve.sh`. The task runs the script by its path, so if you move the clone, run `./update-resolve.sh --reconfigure`. To see or remove the task, open **Task Scheduler**, or run `schtasks /Query /TN "DaVinci Resolve Updater"` in Command Prompt.
 
 The script sends notifications with `notify-send` when it's installed. They also go to the journal. A failed check sends `DaVinci Resolve update failed`. If the API can't be reached (for example right after login), the check is skipped and runs again next time. Only one run happens at a time: while the timer is building, `./update-resolve.sh` stops with `Another update-resolve.sh run is in progress`, and a timer check that finds a manual run in progress skips itself (`.lock` next to the script, needs `flock`, which every systemd distro has).
 
@@ -315,7 +348,7 @@ Answering `never` removes the timer but leaves the `[resolve-local]` repo. To re
 | `city` | all | text | Registration form |
 | `street` | all | text | Registration form |
 | `cleanup_zip` | all | `yes` (default), `no` | Delete the installer zip from `build/` after a successful update. On the Homebrew route, delete Homebrew's cached download instead. |
-| `check_interval` | Linux | `daily`, `weekly` (default), `monthly`, `never` | [Automatic update checks](#automatic-update-checks-linux) |
+| `check_interval` | Linux, Windows | `daily`, `weekly` (default), `monthly`, `never` | [Automatic update checks](#automatic-update-checks) |
 | `homebrew` | macOS | `yes` (default when `brew` is installed), `no` | Install and update through the [Homebrew cask](#homebrew-route) |
 
 To change the interval, run `./update-resolve.sh --reconfigure` and answer the timer question. Editing `check_interval` by hand doesn't change the timer, and `--reconfigure` asks the question again anyway.
@@ -324,7 +357,7 @@ To change the interval, run `./update-resolve.sh --reconfigure` and answer the t
 
 The script has a `PRODUCT` variable near the top (`PRODUCT="davinci-resolve"`), but Studio is not supported or tested:
 
-- The download is always saved as `DaVinci_Resolve_<version>_<Linux|Mac>.zip`, and the registration request names the free product.
+- The download is always saved as `DaVinci_Resolve_<version>_<Linux|Mac|Windows>.zip`, and the registration request names the free product.
 - On Arch, the AUR `davinci-resolve-studio` PKGBUILD expects `DaVinci_Resolve_Studio_<version>_Linux.zip`, so `updpkgsums`/`makepkg` won't find the source.
 - On macOS the Homebrew route ignores `PRODUCT`; the cask is free-only.
 
@@ -332,7 +365,7 @@ If you experiment with it anyway: on macOS also set `homebrew=no`. Editing the t
 
 ## How it works
 
-1. The latest version comes from `https://www.blackmagicdesign.com/api/support/latest-stable-version/<product>/<linux|mac>`, which also returns a download ID.
+1. The latest version comes from `https://www.blackmagicdesign.com/api/support/latest-stable-version/<product>/<linux|mac|windows>`, which also returns a download ID.
 2. Blackmagic only gives out a download URL after a registration POST to `https://www.blackmagicdesign.com/api/register/us/download/<downloadId>`. This is the same request their download page sends. The script sends your saved registration info there and gets back a signed, short-lived URL.
 3. The zip downloads to `build/<name>.zip.part` and is renamed when complete, so an interrupted download is never taken for a finished one. A finished zip already in `build/` is reused unless you pass `--force`.
 
@@ -398,6 +431,18 @@ The background build can't ask for your password. When the new version needs pac
 
 The timer needs a systemd user session (`systemctl --user`). Without one, for example in a container or over some SSH setups, the script skips it. Updating by hand still works.
 
+### Windows: `Missing dependency: cygpath` or `powershell.exe`
+
+The script isn't running in Git Bash. Install Git for Windows with `winget install Git.Git`, open **Git Bash** from the Start menu, and run `./update-resolve.sh` there.
+
+### Windows: `Missing dependency: jq`
+
+The script tries `winget install jqlang.jq` itself. If winget isn't available, install jq yourself and open a new Git Bash window.
+
+### Windows: `The installer failed or the admin prompt was declined`
+
+The installer needs admin rights. Run the script again and click **Yes** in the Windows admin prompt. If it fails again, run the installer from `build/` by hand to see its message: unzip `DaVinci_Resolve_<version>_Windows.zip` and double-click the `.exe` inside.
+
 ### macOS: `Missing dependency: jq`
 
 `jq` is built in from macOS 15. On older versions, install it with `brew install jq`.
@@ -424,6 +469,7 @@ Blackmagic released a version the cask doesn't have yet. The GitHub Action bumps
 | `tests/test-cleanup.sh` | The `cleanup_zip` question is asked once for old configs, saved, reused, defaults to yes, and `cleanup_zip` keeps or deletes the zip accordingly | any | `jq`. No network or sudo. |
 | `tests/test-homebrew-setup.sh` | The Homebrew question (`y`/`Y`/Enter means yes, `n`/`N` means no), no terminal means `no`, no `brew` means `no` without asking, and old configs get `homebrew=no` once | macOS | A fake `brew` is used. No brew commands run. |
 | `tests/test-mac-install.sh` | `install_mac_pkg` finds the `.dmg` inside the zip and the `.pkg` inside that `.dmg`, and passes it to `installer` | macOS | `hdiutil`. `sudo` is replaced with a stub, so nothing is installed. |
+| `tests/test-windows.sh` | The Windows route with stand-ins for `uname`, `cygpath`, `powershell.exe` and `schtasks.exe`: platform detection, the `jq -b` wrapper, reading the installed version (`21.2.0.6` reads as `21.2.0`), running the installer from the zip and its exit codes, and creating and removing the scheduled task | macOS, Linux | `jq` 1.7+ and `zip`. Nothing runs on or touches Windows. |
 | `tests/test-distros.sh` | In one container per distro: `install_run_dependencies` installs Blackmagic's list, `ldd` finds every library `resolve` links against, and the version is read from `Welcome.txt` | Docker host | Docker and an unpacked installer (`squashfs-root`) |
 | `tests/test-timer.sh` | 29 checks in an Arch container: the interval prompt, the systemd units (`systemd-analyze verify`), the `[resolve-local]` repo (sync and files databases), publishing a dummy package, installing it from `[resolve-local]`, upgrading it with `pacman -Syu`, `run_timer` results (up to date, already built, offline), missing build dependencies, the run lock, ignoring a package file without a database entry, and a manual run installing the timer's build instead of downloading | Docker host | Docker. Pulls `archlinux:latest` (amd64). A few minutes. |
 
@@ -433,6 +479,7 @@ Blackmagic released a version the cask doesn't have yet. The GitHub Action bumps
 ./tests/test-homebrew-setup.sh
 ./tests/test-mac-install.sh
 ./tests/test-timer.sh
+./tests/test-windows.sh
 
 # test-distros.sh needs an unpacked installer:
 unzip DaVinci_Resolve_*_Linux.zip && ./DaVinci_Resolve_*_Linux.run --appimage-extract
@@ -452,6 +499,7 @@ Versions are date-based: `YYYY.MM.N`, for example `2026.10.0`, then `2026.10.1` 
   2. Arch: `./tests/test-checksums.sh` and `./tests/test-timer.sh`, then a full update on a real Arch machine (`./update-resolve.sh --force` rebuilds even when you're current). Also do a full run on a clean Arch install when the change touches dependency setup.
   3. Other distros: `./tests/test-distros.sh`, then a full update on at least one real or container install.
   4. macOS: `./tests/test-mac-install.sh` and `./tests/test-homebrew-setup.sh`, then a full update through the script route, and through `brew upgrade` when the cask or `lib/` changes.
+  5. Windows: `./tests/test-windows.sh`, then a full update in Git Bash on a real Windows machine.
 
 ## License
 

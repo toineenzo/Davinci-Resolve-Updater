@@ -1,13 +1,16 @@
 #!/bin/bash
-# update-resolve.sh — Automated DaVinci Resolve updater for Arch Linux and macOS
+# update-resolve.sh — Automated DaVinci Resolve updater for Linux, macOS and Windows
 # Checks for updates, downloads via Blackmagic API, then builds via makepkg
-# (Arch Linux) or installs the bundled .pkg (macOS). The OS is detected automatically.
+# (Arch Linux), runs Blackmagic's installer (other Linux distros, Windows) or
+# installs the bundled .pkg (macOS). The OS is detected automatically.
 #
 # Usage: ./update-resolve.sh [--force] [--check-only] [--skip-install] [--reconfigure]
 #
 # Dependencies (Arch Linux): curl, jq, makepkg, pacman, git, updpkgsums (pacman-contrib)
 # Dependencies (macOS): curl, jq (built into macOS 15+, else `brew install jq`),
 #                       unzip, hdiutil/diskutil, installer (built in)
+# Dependencies (Windows): Git Bash (`winget install Git.Git`), jq (installed with winget
+#                         when missing), powershell.exe (built in)
 #
 # macOS ships bash 3.2: everything that runs there must avoid mapfile and
 # associative arrays. Those are fine inside the Linux-only functions.
@@ -19,7 +22,7 @@
 set -euo pipefail
 
 # Version info
-SCRIPT_VERSION="2026.10.2"
+SCRIPT_VERSION="2026.11.0"
 RESOLVE_TESTED="21.1.2-1"
 
 # Configuration
@@ -29,11 +32,19 @@ CONFIG_FILE="${SCRIPT_DIR}/.config"
 PRODUCT="davinci-resolve"  # Change to "davinci-resolve-studio" for Studio edition
 APP_PATH="/Applications/DaVinci Resolve/DaVinci Resolve.app"  # macOS only
 
-# Platform: Blackmagic's API serves both from the same endpoints, keyed by these names
+# Platform: Blackmagic's API serves all three from the same endpoints, keyed by these names
 case "$(uname -s)" in
-    Darwin) PLATFORM="mac";   ZIP_SUFFIX="Mac";   REFER_PLATFORM="Mac%20OS%20X" ;;
-    *)      PLATFORM="linux"; ZIP_SUFFIX="Linux"; REFER_PLATFORM="Linux" ;;
+    Darwin)               PLATFORM="mac";     ZIP_SUFFIX="Mac";     REFER_PLATFORM="Mac%20OS%20X" ;;
+    MINGW*|MSYS*|CYGWIN*) PLATFORM="windows"; ZIP_SUFFIX="Windows"; REFER_PLATFORM="Windows" ;;
+    *)                    PLATFORM="linux";   ZIP_SUFFIX="Linux";   REFER_PLATFORM="Linux" ;;
 esac
+
+# Windows' jq writes CRLF, so `$(jq -r ...)` would keep a trailing \r; -b (jq 1.7+) writes LF
+if [[ "$PLATFORM" == "windows" ]]; then
+    jq() { command jq -b "$@"; }
+fi
+# Run PowerShell code; Git Bash must not turn its "/i"-style arguments into paths
+ps_run() { MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' powershell.exe -NoProfile -NonInteractive -Command "$1"; }
 
 # Linux install route: Arch builds the AUR package; every other distro runs Blackmagic's
 # own installer, after installing the dependency list that installer itself checks for
@@ -71,6 +82,8 @@ REFER_ID="77ef91f67a9e411bbbe299e595b4cfcc"
 # Shared curl options
 if [[ "$PLATFORM" == "mac" ]]; then
     UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+elif [[ "$PLATFORM" == "windows" ]]; then
+    UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
 else
     UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
 fi
@@ -111,7 +124,7 @@ for arg in "$@"; do
             echo "  --check-only   Just check for updates, don't download or install"
             echo "  --skip-install Download and build but don't install"
             echo "  --reconfigure  Re-enter registration info"
-            echo "  --timer        Unattended check, run by the systemd timer (Linux; see README)"
+            echo "  --timer        Unattended check, run by the systemd timer or Task Scheduler (see README)"
             exit 0
             ;;
         *) err "Unknown argument: $arg"; exit 1 ;;
@@ -149,7 +162,7 @@ prompt_config() {
 
     echo ""
     ask_cleanup_zip
-    [[ "$PLATFORM" != "linux" ]] || ask_check_interval
+    [[ "$PLATFORM" == "mac" ]] || ask_check_interval
     [[ "$PLATFORM" != "mac" ]] || ask_homebrew
 
     # Save config (values are stored verbatim, not as shell code)
@@ -165,12 +178,12 @@ prompt_config() {
         printf 'city=%s\n' "$REG_CITY"
         printf 'street=%s\n' "$REG_STREET"
         printf 'cleanup_zip=%s\n' "$CLEANUP_ZIP"
-        [[ "$PLATFORM" != "linux" ]] || printf 'check_interval=%s\n' "$CHECK_INTERVAL"
+        [[ "$PLATFORM" == "mac" ]] || printf 'check_interval=%s\n' "$CHECK_INTERVAL"
         [[ "$PLATFORM" != "mac" ]] || printf 'homebrew=%s\n' "$USE_HOMEBREW"
     } > "$CONFIG_FILE"
     chmod 600 "$CONFIG_FILE"
     ok "Configuration saved to ${CONFIG_FILE}"
-    [[ "$PLATFORM" != "linux" ]] || setup_timer "$CHECK_INTERVAL"
+    [[ "$PLATFORM" == "mac" ]] || setup_timer "$CHECK_INTERVAL"
     echo ""
 }
 
@@ -196,7 +209,9 @@ ask_check_interval() {
     local answer=""
     # No terminal (the timer itself, cron): never create timers unattended
     if [[ -t 0 ]]; then
-        read -rp "Check for updates automatically with a systemd timer? [d]aily, [w]eekly, [m]onthly or [n]ever [w]: " answer || true
+        local via="a systemd timer"
+        [[ "$PLATFORM" != "windows" ]] || via="Task Scheduler"
+        read -rp "Check for updates automatically with ${via}? [d]aily, [w]eekly, [m]onthly or [n]ever [w]: " answer || true
     else
         answer="n"
     fi
@@ -253,7 +268,7 @@ load_config() {
         ok "Saved Homebrew preference to ${CONFIG_FILE}"
     fi
     CHECK_INTERVAL=$(_cfg check_interval)
-    if [[ "$PLATFORM" == "linux" && -z "$CHECK_INTERVAL" ]]; then
+    if [[ "$PLATFORM" != "mac" && -z "$CHECK_INTERVAL" ]]; then
         ask_check_interval
         printf 'check_interval=%s\n' "$CHECK_INTERVAL" >> "$CONFIG_FILE"
         ok "Saved update check preference to ${CONFIG_FILE}"
@@ -364,6 +379,19 @@ install_dependencies() {
 get_installed_version() {
     if [[ "$PLATFORM" == "mac" ]]; then
         defaults read "${APP_PATH}/Contents/Info" CFBundleShortVersionString 2>/dev/null || echo "none"
+    elif [[ "$PLATFORM" == "windows" ]]; then
+        # Apps & features entry (e.g. 21.2.0.6), else the version of Resolve.exe
+        local v
+        v=$(ps_run '
+            $v = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
+                  Where-Object { $_.DisplayName -match "^DaVinci Resolve( Studio)?$" } | Select-Object -First 1).DisplayVersion
+            $exe = Join-Path $env:ProgramFiles "Blackmagic Design\DaVinci Resolve\Resolve.exe"
+            if (-not $v -and (Test-Path $exe)) { $v = (Get-Item $exe).VersionInfo.ProductVersion }
+            $v' 2>/dev/null | tr -d '\r') || true
+        # Match get_latest_version's major.minor.release: drop the build number, add a missing .0
+        v=$(grep -oE -m1 '^[0-9]+\.[0-9]+(\.[0-9]+)?' <<< "$v") || true
+        [[ -z "$v" || "$v" =~ \.[0-9]+\.[0-9]+$ ]] || v="${v}.0"
+        echo "${v:-none}"
     elif [[ "$LINUX_FAMILY" == "arch" ]]; then
         pacman -Q "${PRODUCT}" 2>/dev/null | awk '{print $2}' | cut -d- -f1 || echo "none"
     else
@@ -568,6 +596,60 @@ install_mac_pkg() {
     trap - EXIT
     rm -rf "$extract_dir"
     ok "Installed $(basename "$pkg")"
+}
+
+# Windows: zip -> Blackmagic's .exe installer, run silently with admin rights (one UAC prompt)
+install_windows_exe() {
+    local version="$1"
+    local zip_path="${BUILD_DIR}/DaVinci_Resolve_${version}_Windows.zip"
+    local extract_dir="${BUILD_DIR}/extract"
+
+    log "Extracting $(basename "$zip_path")..."
+    rm -rf "$extract_dir"
+    mkdir -p "$extract_dir"
+    trap 'rm -rf "'"$extract_dir"'"' EXIT
+    if command -v unzip &>/dev/null; then
+        unzip -q "$zip_path" -d "$extract_dir"
+    else
+        # Windows' own tar (bsdtar, not Git Bash's GNU tar) reads zips too
+        "$(cygpath -S)/tar.exe" -xf "$(cygpath -w "$zip_path")" -C "$(cygpath -w "$extract_dir")"
+    fi
+
+    local exe
+    exe=$(find "$extract_dir" -maxdepth 2 -iname '*.exe' | head -1)
+    if [[ -z "$exe" ]]; then
+        err "No .exe installer found in $(basename "$zip_path")"
+        return 1
+    fi
+
+    if ps_run 'if (-not (Get-Process Resolve -ErrorAction SilentlyContinue)) { exit 1 }' &>/dev/null; then
+        warn "DaVinci Resolve is running — quit it before the installer continues"
+        read -rp "Press Enter once Resolve is closed..."
+    fi
+
+    log "Running $(basename "$exe") (accept the Windows admin prompt; this takes a few minutes)..."
+    # Start-Process -Verb RunAs: Git Bash can't start an installer that needs admin rights itself.
+    # Exit 3 = installed, restart needed (3010/1641 don't survive bash's 8-bit exit status).
+    local rc=0
+    RESOLVE_INSTALLER=$(cygpath -w "$exe") ps_run '
+        $p = Start-Process -FilePath $env:RESOLVE_INSTALLER -ArgumentList "/i","/q","/noreboot" -Verb RunAs -Wait -PassThru
+        if ($p.ExitCode -in 3010, 1641) { exit 3 }
+        if ($null -ne $p.ExitCode -and $p.ExitCode -ne 0) { Write-Host "Installer exit code $($p.ExitCode)"; exit 1 }' || rc=$?
+    rm -rf "$extract_dir"
+    trap - EXIT
+    case $rc in
+        0) ;;
+        3) warn "Restart Windows to finish the installation" ;;
+        *) err "The installer failed or the admin prompt was declined"; return 1 ;;
+    esac
+
+    local now
+    now=$(get_installed_version)
+    if [[ "$now" != "$version" ]]; then
+        err "Installer finished, but Windows reports DaVinci Resolve ${now} instead of ${version}"
+        return 1
+    fi
+    ok "Installed DaVinci Resolve ${version}"
 }
 
 # --- Other Linux distros: Blackmagic's own installer ---
@@ -873,6 +955,17 @@ SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 # Desktop notification when possible; the text also lands in the journal
 notify() {
     echo "$1: $2"
+    if [[ "$PLATFORM" == "windows" ]]; then
+        N_TITLE="$1" N_TEXT="$2" ps_run '
+            Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+            $n = New-Object System.Windows.Forms.NotifyIcon
+            $n.Icon = [System.Drawing.SystemIcons]::Information
+            $n.Visible = $true
+            $n.ShowBalloonTip(10000, $env:N_TITLE, $env:N_TEXT, "Info")
+            Start-Sleep -Seconds 10
+            $n.Dispose()' &>/dev/null || true
+        return 0
+    fi
     command -v notify-send &>/dev/null && notify-send -a "DaVinci Resolve Updater" "$1" "$2" 2>/dev/null || true
 }
 
@@ -905,6 +998,7 @@ EOF
 }
 
 setup_timer() {
+    [[ "$PLATFORM" != "windows" ]] || { setup_windows_task "$1"; return; }
     local interval="$1" have_systemd=true
     command -v systemctl &>/dev/null && systemctl --user show-environment &>/dev/null || have_systemd=false
 
@@ -935,6 +1029,33 @@ setup_timer() {
     else
         log "You'll get a notification when an update is available"
     fi
+}
+
+WINDOWS_TASK="DaVinci Resolve Updater"
+
+# Task Scheduler runs `bash -l update-resolve.sh --timer` (login shell: Git Bash's PATH with curl)
+setup_windows_task() {
+    local interval="$1"
+    if [[ "$interval" == "never" ]]; then
+        if MSYS_NO_PATHCONV=1 schtasks.exe /Query /TN "$WINDOWS_TASK" &>/dev/null; then
+            MSYS_NO_PATHCONV=1 schtasks.exe /Delete /TN "$WINDOWS_TASK" /F > /dev/null
+            ok "Removed the automatic update check"
+        fi
+        return 0
+    fi
+    local schedule bash_exe
+    schedule=$(tr '[:lower:]' '[:upper:]' <<< "$interval")
+    bash_exe=$(cygpath -w "$BASH")
+    [[ "$bash_exe" == *.exe ]] || bash_exe="${bash_exe}.exe"
+    MSYS_NO_PATHCONV=1 schtasks.exe /Create /F /TN "$WINDOWS_TASK" /SC "$schedule" /ST 12:00 \
+        /TR "\"${bash_exe}\" -l \"$(cygpath -w "${SCRIPT_DIR}/update-resolve.sh")\" --timer" > /dev/null
+    # Catch up on a check missed while the computer was off (schtasks has no flag for this)
+    T_NAME="$WINDOWS_TASK" ps_run '
+        $t = Get-ScheduledTask -TaskName $env:T_NAME
+        $t.Settings.StartWhenAvailable = $true
+        Set-ScheduledTask -InputObject $t' > /dev/null || warn "Couldn't set the task to catch up on missed checks"
+    ok "Checking for updates ${interval} (Task Scheduler: ${WINDOWS_TASK})"
+    log "You'll get a notification when an update is available"
 }
 
 # One-time (sudo): a directory you own for built packages, registered in pacman.conf.
@@ -1006,7 +1127,9 @@ run_timer() {
     fi
     # Report any failure as a notification, not only in the journal
     set -o errtrace
-    trap 'notify "DaVinci Resolve update failed" "See: journalctl --user -u resolve-update"' ERR
+    local see="See: journalctl --user -u resolve-update"
+    [[ "$PLATFORM" != "windows" ]] || see="Run ${SCRIPT_DIR}/update-resolve.sh in Git Bash to see why"
+    trap 'notify "DaVinci Resolve update failed" "$see"' ERR
 
     local installed latest_info latest download_id
     installed=$(get_installed_version)
@@ -1066,6 +1189,24 @@ check_tools_mac() {
     done
 }
 
+check_tools_windows() {
+    # winget links the commands it installs here; a Git Bash opened before that lacks it on PATH
+    [[ -z "${LOCALAPPDATA:-}" ]] || PATH="${PATH}:$(cygpath "$LOCALAPPDATA")/Microsoft/WinGet/Links"
+    if ! command -v jq &>/dev/null && command -v winget &>/dev/null; then
+        log "Installing jq with winget..."
+        winget install --id jqlang.jq --exact --source winget --accept-source-agreements --accept-package-agreements
+    fi
+    local cmd
+    for cmd in curl jq cygpath powershell.exe; do
+        if ! command -v "$cmd" &>/dev/null; then
+            err "Missing dependency: $cmd"
+            [[ "$cmd" != "jq" ]] || err "Install it with: winget install jqlang.jq"
+            [[ "$cmd" != "cygpath" ]] || err "Run this script in Git Bash (winget install Git.Git)"
+            exit 1
+        fi
+    done
+}
+
 check_tools_linux() {
     # Install script dependencies if missing (command -> package that provides it)
     local -A tool_pkgs=([curl]=curl [jq]=jq [git]=git [updpkgsums]=pacman-contrib)
@@ -1111,6 +1252,8 @@ main() {
     echo -e "${BLUE}╔══════════════════════════════════════════╗${NC}"
     if [[ "$PLATFORM" == "mac" ]]; then
         echo -e "${BLUE}║    DaVinci Resolve Updater for macOS     ║${NC}"
+    elif [[ "$PLATFORM" == "windows" ]]; then
+        echo -e "${BLUE}║   DaVinci Resolve Updater for Windows    ║${NC}"
     elif [[ "$LINUX_FAMILY" == "arch" ]]; then
         echo -e "${BLUE}║  DaVinci Resolve Updater for Arch Linux  ║${NC}"
     else
@@ -1121,6 +1264,8 @@ main() {
 
     if [[ "$PLATFORM" == "mac" ]]; then
         check_tools_mac
+    elif [[ "$PLATFORM" == "windows" ]]; then
+        check_tools_windows
     elif [[ "$LINUX_FAMILY" == "arch" ]]; then
         check_tools_linux
     else
@@ -1138,7 +1283,7 @@ main() {
     fi
 
     if [[ "$TIMER" == "true" ]]; then
-        [[ "$PLATFORM" == "linux" ]] || { err "--timer is for Linux; on macOS use the Homebrew cask"; exit 1; }
+        [[ "$PLATFORM" != "mac" ]] || { err "--timer is for Linux and Windows; on macOS use the Homebrew cask"; exit 1; }
         run_timer
         exit 0
     fi
@@ -1204,7 +1349,7 @@ main() {
         exit 0
     fi
 
-    if [[ "$PLATFORM" == "mac" ]]; then
+    if [[ "$PLATFORM" == "mac" || "$PLATFORM" == "windows" ]]; then
         mkdir -p "$BUILD_DIR"
         download_resolve "$download_id" "$latest_version"
 
@@ -1213,12 +1358,20 @@ main() {
             exit 0
         fi
 
-        install_mac_pkg "$latest_version"
+        if [[ "$PLATFORM" == "mac" ]]; then
+            install_mac_pkg "$latest_version"
+        else
+            install_windows_exe "$latest_version"
+        fi
         cleanup_zip "$latest_version"
 
         echo ""
         ok "DaVinci Resolve ${latest_version} installed successfully!"
-        log "Launch it from /Applications/DaVinci Resolve."
+        if [[ "$PLATFORM" == "mac" ]]; then
+            log "Launch it from /Applications/DaVinci Resolve."
+        else
+            log "Launch it from the Start menu."
+        fi
         exit 0
     fi
 

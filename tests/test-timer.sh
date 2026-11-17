@@ -17,7 +17,7 @@ pass() { echo "PASS $1"; }
 fail() { echo "FAIL $1"; failures=$((failures + 1)); }
 
 sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf   # pacman's sandbox fails under emulation
-pacman -Sy --noconfirm --needed base-devel sudo systemd jq > /dev/null 2>&1
+pacman -Syu --noconfirm --needed base-devel sudo systemd jq > /dev/null 2>&1   # -Syu: a partial -Sy can break on image skew
 useradd -m t && echo 't ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/t
 cp -r /src /home/t/repo && chown -R t /home/t/repo
 
