@@ -39,7 +39,16 @@ class BlackmagicDownloadStrategy < CurlDownloadStrategy
       req["User-Agent"] = USER_AGENT
       req.body = registration.merge("product" => "DaVinci Resolve").to_json
 
-      res = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) { |http| http.request(req) }
+      attempts = 0
+      begin
+        res = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) { |http| http.request(req) }
+      rescue SocketError # DNS lookup failed (getaddrinfo); often a momentary blip, so try once more
+        attempts += 1
+        raise if attempts > 1
+
+        sleep 3
+        retry
+      end
       body = res.body.to_s.strip
       unless res.is_a?(Net::HTTPSuccess) && body.start_with?("http")
         raise CurlDownloadStrategyError.new(url, "Blackmagic download API refused the request: #{body}")
