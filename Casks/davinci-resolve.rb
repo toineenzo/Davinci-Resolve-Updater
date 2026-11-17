@@ -4,7 +4,7 @@ cask "davinci-resolve" do
   # Bumped automatically by .github/workflows/bump-cask.yml from Blackmagic's API.
   # Blackmagic publishes no checksum; the workflow downloads each release once to compute it.
   version "21.2.0"
-  sha256 "9511b293abd4996f5b4101c96fbd652bf75fc470df76a54f62fca1dc9ab0d969"
+  sha256 "3f0a8ea61081874f06c772b2f07495180a3d5a1b62e1bcfd0c61740fb234be57"
 
   url "https://www.blackmagicdesign.com/api/register/us/download/0c2e03fcd586438bae0d268fbc3ad477",
       using: BlackmagicDownloadStrategy
