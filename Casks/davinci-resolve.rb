@@ -5,6 +5,7 @@ cask "davinci-resolve" do
   # Blackmagic publishes no checksum; the workflow downloads each release once to compute it.
   version "21.2.0"
   sha256 "3f0a8ea61081874f06c772b2f07495180a3d5a1b62e1bcfd0c61740fb234be57"
+  # etag a46b4ca47032986c378dfb2cbb874fac-495
 
   url "https://www.blackmagicdesign.com/api/register/us/download/0c2e03fcd586438bae0d268fbc3ad477",
       using: BlackmagicDownloadStrategy
