@@ -40,10 +40,10 @@ jobs:
             echo "Unexpected API response: $latest" >&2; exit 1; }
 
           current=$(sed -n 's/^  version "\(.*\)"$/\1/p' Casks/davinci-resolve.rb)
-          if [[ "$current" == "$version" && "$REHASH" != "true" ]]; then
-            echo "Already at $version"
-            exit 0
-          fi
+          # Same version: the next step still compares the file's ETag, because Blackmagic
+          # sometimes re-uploads a release under the same version and downloadId
+          recheck=false
+          [[ "$current" == "$version" && "$REHASH" != "true" ]] && recheck=true
           # Never go backwards if the API briefly reports an older build
           if [[ "$(printf '%s\n%s\n' "$current" "$version" | sort -V | tail -1)" != "$version" ]]; then
             echo "API reports $version, older than $current; leaving cask alone"
@@ -52,12 +52,14 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "download_id=$download_id" >> "$GITHUB_OUTPUT"
           echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "recheck=$recheck" >> "$GITHUB_OUTPUT"
 
       - name: Download once to compute sha256
         id: hash
         if: steps.check.outputs.version
         env:
           DOWNLOAD_ID: ${{ steps.check.outputs.download_id }}
+          RECHECK: ${{ steps.check.outputs.recheck }}
           BMD_FIRSTNAME: ${{ secrets.BMD_FIRSTNAME }}
           BMD_LASTNAME: ${{ secrets.BMD_LASTNAME }}
           BMD_EMAIL: ${{ secrets.BMD_EMAIL }}
@@ -69,6 +71,7 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -z "$BMD_FIRSTNAME" || -z "$BMD_EMAIL" ]]; then
+            [[ "$RECHECK" == "true" ]] && { echo "Already at version; no secrets to check the file"; exit 0; }
             echo "::warning::BMD_* secrets not set; bumping with sha256 :no_check"
             echo "sha256=:no_check" >> "$GITHUB_OUTPUT"
             exit 0
@@ -84,14 +87,25 @@ jobs:
             -H "Referer: https://www.blackmagicdesign.com/support/download/77ef91f67a9e411bbbe299e595b4cfcc/Mac%20OS%20X" \
             -H "User-Agent: $ua" -d "$payload")
           [[ "$url" == https://* ]] || { echo "Blackmagic refused the download request: $url" >&2; exit 1; }
+          etag=$(curl -fsSIL -H "User-Agent: $ua" "$url" | tr -d '\r"' | awk 'tolower($1)=="etag:"{e=$2} END{print e}')
+          echo "etag=$etag" >> "$GITHUB_OUTPUT"
+          if [[ "$RECHECK" == "true" ]]; then
+            recorded=$(sed -n 's/^  # etag //p' Casks/davinci-resolve.rb)
+            if [[ -z "$etag" || "$etag" == "$recorded" ]]; then
+              echo "Already at version, file unchanged (etag ${etag:-unknown})"
+              exit 0
+            fi
+            echo "::warning::Same version but the file changed (etag $recorded -> $etag); rehashing"
+          fi
           sha=$(curl -fsSL -H "User-Agent: $ua" "$url" | sha256sum | cut -d' ' -f1)
           [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || { echo "Bad sha256: $sha" >&2; exit 1; }
           echo "sha256 $sha"
           echo "sha256=\"$sha\"" >> "$GITHUB_OUTPUT"
 
       - name: Update cask and commit
-        if: steps.check.outputs.version
+        if: steps.hash.outputs.sha256
         env:
+          ETAG: ${{ steps.hash.outputs.etag }}
           VERSION: ${{ steps.check.outputs.version }}
           DOWNLOAD_ID: ${{ steps.check.outputs.download_id }}
           CURRENT: ${{ steps.check.outputs.current }}
@@ -102,6 +116,9 @@ jobs:
           sed -i -e "s/^  version \".*\"$/  version \"$VERSION\"/" \
                  -e "s/^  sha256 .*$/  sha256 $SHA256/" \
                  -e "s#/api/register/us/download/[0-9a-f]\{32\}#/api/register/us/download/$DOWNLOAD_ID#" "$cask"
+          # The file's ETag, so a re-upload under the same version is noticed on the next run
+          sed -i '/^  # etag /d' "$cask"
+          [[ -z "$ETAG" ]] || sed -i "/^  sha256 /a\\  # etag $ETAG" "$cask"
           if git diff --quiet; then
             echo "Cask already matches $VERSION ($SHA256)"
             exit 0
